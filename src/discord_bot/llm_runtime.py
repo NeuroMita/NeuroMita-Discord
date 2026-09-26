@@ -93,20 +93,27 @@ class DiscordLLMRuntime:
         if self._closed:
             raise RuntimeError("Discord LLM runtime is closed")
 
+        if not self.presets_controller.presets:
+            from handlers.llm_providers.base import LLMResponse
+
+            return LLMResponse(
+                text=None,
+                error_message="No configured API preset. Add a user API preset with endpoint and model under DiscordData/Settings/api_presets.json, plus a key if its provider requires one.",
+            )
+
         chain = self.preset_resolver.resolve_chain(preset_id)
         configured = [
             preset for preset in chain
-            if preset.api_key.strip()
-            and preset.api_url.strip()
-            and preset.api_model.strip()
-            and preset.provider_name.strip()
+            if str(preset.api_url or "").strip()
+            and str(preset.api_model or "").strip()
+            and str(preset.provider_name or "").strip()
         ]
         if not configured:
             from handlers.llm_providers.base import LLMResponse
 
             return LLMResponse(
                 text=None,
-                error_message="No configured API preset. Add an API preset with endpoint, model, and key under DiscordData/Settings/api_presets.json.",
+                error_message="No configured API preset. Add an API preset with endpoint and model under DiscordData/Settings/api_presets.json, plus a key if its provider requires one.",
             )
 
         def build_request(preset, model: str):

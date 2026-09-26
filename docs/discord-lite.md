@@ -12,7 +12,7 @@ python3 -m venv .venv-discord
 python -m pip install -r requirements-discord.txt
 ```
 
-Configure the NeuroMita API preset files and `settings.json` under `DiscordData/Settings/`. Do not copy desktop settings wholesale; add only the preset(s) and credentials needed on this server. Keep the data directory private (`chmod 700 DiscordData`) and the preset file private (`chmod 600 DiscordData/Settings/api_presets.json`). Never commit these files.
+Configure the NeuroMita API preset files and `settings.json` under `DiscordData/Settings/`. Do not copy desktop settings wholesale; add only the preset(s) and credentials needed on this server. A key is optional for keyless `common` endpoints such as a private Ollama or LM Studio server; use a key when the selected provider requires one. Keep the data directory private (`chmod 700 DiscordData`) and the preset file private (`chmod 600 DiscordData/Settings/api_presets.json`). Never commit these files.
 
 Run one request without connecting to Discord:
 

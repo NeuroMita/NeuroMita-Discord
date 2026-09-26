@@ -38,6 +38,7 @@ class DiscordLlmSmokeTests(unittest.TestCase):
             ):
                 run.return_value = type("Response", (), {"text": "pong"})()
                 runtime = DiscordLLMRuntime(data_dir=Path(data_dir))
+                runtime.presets_controller.presets[1] = object()
                 try:
                     self.assertEqual(os.environ["NEUROMITA_BASE_DIR"], str(Path(data_dir).resolve()))
                     response = runtime.generate([
@@ -89,11 +90,39 @@ class DiscordLlmSmokeTests(unittest.TestCase):
         self.assertIn("No configured API preset", result.error_message)
         run.assert_not_called()
 
+    def test_runtime_allows_keyless_common_api_presets(self):
+        from discord_bot.llm_runtime import DiscordLLMRuntime
+
+        preset = type("Preset", (), {
+            "api_key": "",
+            "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+            "api_model": "qwen-local",
+            "provider_name": "common",
+        })()
+
+        with tempfile.TemporaryDirectory() as data_dir:
+            with (
+                patch("managers.api_preset_resolver.ApiPresetResolver.resolve_chain", return_value=[preset]),
+                patch("managers.llm_request_runner.LLMRequestRunner.run") as run,
+            ):
+                run.return_value = type("Response", (), {"text": "local response"})()
+                runtime = DiscordLLMRuntime(data_dir=Path(data_dir))
+                runtime.presets_controller.presets[1] = object()
+                try:
+                    response = runtime.generate([{"role": "user", "content": "ping"}])
+                finally:
+                    runtime.close()
+
+        self.assertEqual(response.text, "local response")
+        run.assert_called_once()
+
     def test_import_does_not_load_heavy_desktop_or_media_modules(self):
         script = (
-            "import sys; from discord_bot.llm_runtime import DiscordLLMRuntime; "
+            "import sys, tempfile; from discord_bot.llm_runtime import DiscordLLMRuntime; "
+            "from pathlib import Path; temp = tempfile.TemporaryDirectory(); "
+            "runtime = DiscordLLMRuntime(data_dir=Path(temp.name)); "
             "forbidden = {'PyQt6', 'torch', 'transformers', 'cv2', 'pygame', 'pyaudio'}; "
-            "loaded = forbidden.intersection(sys.modules); "
+            "loaded = forbidden.intersection(sys.modules); runtime.close(); temp.cleanup(); "
             "assert not loaded, sorted(loaded)"
         )
         environment = os.environ.copy()
@@ -192,6 +221,7 @@ class DiscordLlmSmokeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as data_dir:
             runtime = DiscordLLMRuntime(data_dir=Path(data_dir))
+            runtime.presets_controller.presets[1] = object()
             runtime.runner.provider_manager.close()
             runtime.runner.provider_manager = ProviderManager(
                 provider_names=("common",), lazy=True
