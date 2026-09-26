@@ -1222,6 +1222,10 @@ class HistoryController(HistoryService):
         except Exception:
             return ""
 
+    def get_summary(self, character) -> str:
+        """Public read-only summary access for lightweight runtime adapters."""
+        return self._get_history_summary(character)
+
     def _get_history_summary_count(self, character) -> int:
         try:
             value = character.get_variable(self._SUMMARY_COUNT_VAR, 0)

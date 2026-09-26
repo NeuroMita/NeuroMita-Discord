@@ -662,6 +662,10 @@ class MemoryManager(CharacterScopedService):
 
     def _schedule_embed(self, eternal_id, content) -> None:
         """Schedule a background RAG (re)embedding for a memory. No-op without RAG."""
+        if not bool(SettingsManager.get("RAG_ENABLED", False)):
+            return
+        if not bool(SettingsManager.get("RAG_VECTOR_SEARCH_ENABLED", False)):
+            return
         if type(self)._EMBED_EXECUTOR_SHUTDOWN:
             return
         if not self.rag:
@@ -978,6 +982,35 @@ class MemoryManager(CharacterScopedService):
             cursor.execute(f"SELECT content FROM memories WHERE {where}", tuple(params))
             row = cursor.fetchone()
             return row[0] if row else None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def list_memories(self, limit: int = 20, *, include_forgotten: bool = False) -> list[dict]:
+        """Return a bounded, safe view of this character's stored memories."""
+        cols = self._mem_cols()
+        selected = [
+            name for name in (
+                "eternal_id", "content", "type", "priority", "date_created", "is_forgotten"
+            ) if name in cols
+        ]
+        if "eternal_id" not in selected or "content" not in selected:
+            return []
+        where = ["character_id=?", "is_deleted=0"]
+        params: list[object] = [self.storage_key]
+        if not include_forgotten and "is_forgotten" in cols:
+            where.append("is_forgotten=0")
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT {', '.join(selected)} FROM memories WHERE {' AND '.join(where)} "
+                "ORDER BY eternal_id DESC LIMIT ?",
+                (*params, max(1, min(50, int(limit)))),
+            )
+            return [dict(zip(selected, row)) for row in cursor.fetchall()]
         finally:
             try:
                 conn.close()

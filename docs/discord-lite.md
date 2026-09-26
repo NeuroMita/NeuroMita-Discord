@@ -32,10 +32,18 @@ Set the bot token in the process environment; do not put it in settings or commi
 export DISCORD_BOT_TOKEN='...'
 # Optional: make slash commands available immediately in one development server.
 export DISCORD_GUILD_ID='123456789012345678'
+# Optional: restrict to one channel; defaults target the NeuroMita test channel.
+export DISCORD_CHANNEL_ID='1353745092065624144'
+# Optional: comma-separated admin user IDs; defaults to the project owner.
+export DISCORD_ADMIN_IDS='292002437932384256'
 PYTHONPATH=src python -m discord_bot
 ```
 
-Without `DISCORD_GUILD_ID`, slash commands are synced globally and may take time to appear. In the Discord Developer Portal, enable **Message Content Intent** for the bot. The runtime requests no members or presence intents. It responds to `/chat ask`, direct messages, mentions, and replies to its messages. Each request is independent; conversation history is not stored yet. LLM work is limited to one generation at a time and runs outside the Discord event loop. Long answers are split into Discord-sized messages.
+Slash commands are synced to `DISCORD_GUILD_ID`. In the Discord Developer Portal, enable **Message Content Intent** for the bot. The runtime requests no members or presence intents. It responds only in the configured guild and channel; DMs and threads are ignored. Mentions, replies, and `/chat ask` share the active NeuroMita character's history across Discord users. RAG uses the `Keyword+FTS only` preset (SQLite FTS5 and keyword search; vector search and reranking remain off). LLM work is limited to one generation at a time and runs outside the Discord event loop. Long answers are split into Discord-sized messages.
+
+Only IDs in `DISCORD_ADMIN_IDS` can use the ephemeral `/bot`, `/character`, `/history`, `/memory`, `/ai`, `/compression`, and `/debug` administration commands, and only in the configured channel. History resets and memory deletion require an explicit confirmation argument. Prompt assets should be installed in the normal NeuroMita `Prompts` tree or selected with `NEUROMITA_PROMPTS_DIR`.
+
+Discord conversation history and memory share the active character's standard NeuroMita storage under `DiscordData/Histories` and its character memory database. Do not share this runtime data directory with a desktop NeuroMita process while both are running.
 
 Keep the token in the service manager's protected environment when deploying. The bot does not start automatically from the CLI smoke test; the gateway starts only when `python -m discord_bot` is run with a token configured.
 
