@@ -24,6 +24,21 @@ An alternate data directory can be selected with `--data-dir`; an optional prese
 
 Only move on to the Discord gateway after this CLI request succeeds on the target VPS.
 
+## Stage 2: Discord gateway
+
+Set the bot token in the process environment; do not put it in settings or commit it:
+
+```bash
+export DISCORD_BOT_TOKEN='...'
+# Optional: make slash commands available immediately in one development server.
+export DISCORD_GUILD_ID='123456789012345678'
+PYTHONPATH=src python -m discord_bot
+```
+
+Without `DISCORD_GUILD_ID`, slash commands are synced globally and may take time to appear. In the Discord Developer Portal, enable **Message Content Intent** for the bot. The runtime requests no members or presence intents. It responds to `/chat ask`, direct messages, mentions, and replies to its messages. Each request is independent; conversation history is not stored yet. LLM work is limited to one generation at a time and runs outside the Discord event loop. Long answers are split into Discord-sized messages.
+
+Keep the token in the service manager's protected environment when deploying. The bot does not start automatically from the CLI smoke test; the gateway starts only when `python -m discord_bot` is run with a token configured.
+
 ## Memory budget
 
 The VPS's roughly 500 MB currently available is shared with the OS and VPN. Treat it as the whole remaining headroom, not the bot allocation. Start with one generation worker and short conversations; measure the process RSS and available host memory on the VPS before raising concurrency or adding features. Swap is only an OOM buffer, not usable RAM.
