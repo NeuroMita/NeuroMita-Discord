@@ -5,6 +5,7 @@ __pycache__
 
 # Discord Lite credentials, configuration, and conversation storage.
 /DiscordData/
+/scripts/.bootstrap/effective-requirements.txt
 build_VinerX.py
 build.env
 .req_hash
