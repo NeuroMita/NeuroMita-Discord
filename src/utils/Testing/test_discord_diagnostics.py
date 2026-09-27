@@ -21,11 +21,15 @@ class DiscordRuntimeDiagnosticsTests(unittest.TestCase):
                 content="private conversation text",
                 token="secret-token",
             )
+            diagnostics.record(
+                "room_observation_skipped", reason="observation_busy",
+                room_context="private room text", summary="private summary",
+            )
             self.assertIn(str(os.getpid()), diagnostics.path.name)
             diagnostics.close()
 
             lines = diagnostics.path.read_text(encoding="utf-8").splitlines()
-            line = lines[-1]
+            line = lines[0]
             payload = json.loads(line)
             self.assertEqual(payload["pid"], os.getpid())
             self.assertTrue(payload["run_id"])
@@ -36,6 +40,10 @@ class DiscordRuntimeDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("secret-token", line)
             self.assertNotIn("content", payload)
             self.assertNotIn("token", payload)
+            observation = json.loads(lines[-1])
+            self.assertEqual(observation["reason"], "observation_busy")
+            self.assertNotIn("private room text", lines[-1])
+            self.assertNotIn("private summary", lines[-1])
 
     def test_gateway_failure_remains_logged_after_client_shutdown(self):
         from discord_bot.bot import DiscordBot

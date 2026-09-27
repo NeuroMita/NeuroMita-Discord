@@ -18,12 +18,15 @@ class AttentionDecision:
     diagnostic_status: int | None = None
 
 
-REASONS = frozenset({
+SOCIAL_ACTIONS = frozenset({"silent", "join"})
+INITIATIVE_ACTIONS = frozenset({"silent", "start_topic", "silence_ping"})
+SOCIAL_REASONS = frozenset({
     "direct_relevance", "open_question", "topic_fit", "social_moment", "invited",
     "conversation_active", "conversation_closed", "nothing_to_add", "too_intrusive",
-    "room_quiet", "good_topic_to_start", "silence_checkin", "decision_error",
 })
-ACTIONS = frozenset({"silent", "join", "start_topic", "silence_ping"})
+INITIATIVE_REASONS = frozenset({
+    "room_quiet", "good_topic_to_start", "silence_checkin", "nothing_to_add", "too_intrusive",
+})
 SILENT = AttentionDecision(False, "silent", 0, None, "decision_error")
 
 
@@ -42,7 +45,10 @@ class DiscordAttentionService:
             "nothing_to_add, too_intrusive. Never invent reason codes. Never write the actual reply.\n"
             f"Initiative setting: {max(0, min(100, int(initiative_level)))}\n{room_context}"
         )
-        return self._decide(prompt, room_context, fallback_action="join")
+        return self._decide(
+            prompt, room_context, allowed_actions=SOCIAL_ACTIONS,
+            allowed_reasons=SOCIAL_REASONS, allow_reply_target=True,
+        )
 
     def decide_initiative(
         self, *, room_context: str, initiative_level: int,
@@ -58,9 +64,15 @@ class DiscordAttentionService:
             f"Room quiet seconds: {max(0, int(silence_seconds))}; human messages since Mita: "
             f"{max(0, int(human_messages_since_mita))}\n{room_context}"
         )
-        return self._decide(prompt, room_context, fallback_action="start_topic")
+        return self._decide(
+            prompt, room_context, allowed_actions=INITIATIVE_ACTIONS,
+            allowed_reasons=INITIATIVE_REASONS, allow_reply_target=False,
+        )
 
-    def _decide(self, prompt: str, room_context: str, *, fallback_action: str) -> AttentionDecision:
+    def _decide(
+        self, prompt: str, room_context: str, *, allowed_actions: frozenset[str],
+        allowed_reasons: frozenset[str], allow_reply_target: bool,
+    ) -> AttentionDecision:
         from services.contracts import UtilityGenerationRequest
 
         try:
@@ -91,7 +103,8 @@ class DiscordAttentionService:
                 return self._silent("empty_result")
             valid_ids = set(re.findall(r"\[message_id:([0-9]+)\]", room_context))
             return self._parse_decision(
-                raw, valid_reply_ids=valid_ids, fallback_action=fallback_action,
+                raw, valid_reply_ids=valid_ids, allowed_actions=allowed_actions,
+                allowed_reasons=allowed_reasons, allow_reply_target=allow_reply_target,
             )
         except Exception:
             from logging import getLogger
@@ -138,44 +151,37 @@ class DiscordAttentionService:
 
     @staticmethod
     def _parse_decision(
-        raw: str, *, valid_reply_ids: set[str], fallback_action: str = "join",
+        raw: str, *, valid_reply_ids: set[str], allowed_actions: frozenset[str],
+        allowed_reasons: frozenset[str], allow_reply_target: bool,
     ) -> AttentionDecision:
         try:
             text = str(raw or "").strip()
             if text.startswith("```"):
                 text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
             data = json.loads(text)
-            if not isinstance(data, dict) or not isinstance(data.get("speak"), bool):
+            if not isinstance(data, dict) or type(data.get("speak")) is not bool:
                 return DiscordAttentionService._silent("invalid_schema")
-            action = str(data.get("action", "silent"))
-            reason = str(data.get("reason_code", "decision_error"))
-            diagnostic_code = ""
-            if reason not in REASONS:
-                reason = "topic_fit" if data["speak"] else "nothing_to_add"
-                diagnostic_code = "unrecognized_reason"
-            desire_raw = data.get("desire", 0)
+            desire_raw = data.get("desire")
             if type(desire_raw) is not int:
                 return DiscordAttentionService._silent("invalid_desire")
             desire = desire_raw
-            if action not in ACTIONS:
-                if not data["speak"] or fallback_action not in {"join", "start_topic"}:
-                    return DiscordAttentionService._silent("invalid_action")
-                action = fallback_action
-                diagnostic_code = "unrecognized_action"
-            if reason not in REASONS:
-                return DiscordAttentionService._silent("invalid_reason")
             if not 0 <= desire <= 100:
                 return DiscordAttentionService._silent("invalid_desire")
+            action = data.get("action")
+            if not isinstance(action, str) or action not in allowed_actions:
+                return DiscordAttentionService._silent("invalid_action")
+            reason = data.get("reason_code")
+            if not isinstance(reason, str) or reason not in allowed_reasons:
+                return DiscordAttentionService._silent("invalid_reason")
             reply_to = data.get("reply_to_message_id")
             if reply_to is not None:
-                reply_to = str(reply_to)
-                if reply_to not in valid_reply_ids:
+                if not allow_reply_target or not isinstance(reply_to, str) or reply_to not in valid_reply_ids:
                     return DiscordAttentionService._silent("invalid_reply_target")
-            if data["speak"] and action == "silent":
+            if data["speak"] is (action == "silent"):
                 return DiscordAttentionService._silent("invalid_speak_action")
             if not data["speak"]:
-                return AttentionDecision(False, "silent", desire, None, reason, diagnostic_code)
-            return AttentionDecision(True, action, desire, reply_to, reason, diagnostic_code)
+                return AttentionDecision(False, "silent", desire, None, reason)
+            return AttentionDecision(True, action, desire, reply_to, reason)
         except json.JSONDecodeError:
             return DiscordAttentionService._silent("invalid_json")
         except (ValueError, TypeError):

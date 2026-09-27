@@ -16,11 +16,17 @@ def register_presence_commands(bot) -> None:
             return
         state = bot.presence.status()
         await interaction.response.send_message(
-            f"Enabled: {state['enabled']} | mode: {state['mode']} | initiative: {state['initiative']}\n"
-            f"Cooldown: {state['cooldown_seconds']}s | max/hour: {state['max_per_hour']}\n"
+            f"Mode: {state['mode']} | enabled: {state['enabled']} | initiative: {state['initiative']}\n"
+            f"Voluntary: {state['voluntary_1h_count']} / {state['max_per_hour']} this hour\n"
+            f"Autonomous: {state['initiative_6h_count']} / {state['initiative_max_per_6h']} this 6h\n"
+            f"Unanswered streak: {state['unanswered_streak']} | cooldown: {state['cooldown_seconds']}s\n"
+            f"Last initiative: {state['last_initiative_at'] or 'never'}\n"
+            f"Last silence ping: {state['last_silence_ping_at'] or 'never'}\n"
             f"Messages seen: {state['messages_seen']} | last: "
             f"{state['last_attention_action']} ({state['last_attention_reason']})\n"
-            f"Paused until: {state['paused_until'] or 'no'} | busy: {state['attention_busy'] or state['generation_busy']}",
+            f"Paused until: {state['paused_until'] or 'no'} | generation busy: {state['generation_busy']}\n"
+            f"Utility busy: {state['utility_busy']} | attention busy: {state['attention_busy']} | "
+            f"observation busy: {state['observation_busy']}",
             ephemeral=True,
         )
 

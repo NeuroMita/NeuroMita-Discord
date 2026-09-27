@@ -11,16 +11,21 @@ class DiscordAttentionTests(unittest.TestCase):
         from discord_bot.attention import DiscordAttentionService, SILENT
 
         parse = DiscordAttentionService._parse_decision
-        invalid_json = parse("not json", valid_reply_ids=set())
+        parse_args = {
+            "allowed_actions": frozenset({"silent", "join"}),
+            "allowed_reasons": frozenset({"topic_fit"}),
+            "allow_reply_target": True,
+        }
+        invalid_json = parse("not json", valid_reply_ids=set(), **parse_args)
         self.assertFalse(invalid_json.speak)
         self.assertEqual(invalid_json.diagnostic_code, "invalid_json")
         self.assertEqual(parse(
             '{"speak":true,"action":"join","desire":90,"reply_to_message_id":"999","reason_code":"topic_fit"}',
-            valid_reply_ids={"1"},
+            valid_reply_ids={"1"}, **parse_args,
         ).diagnostic_code, "invalid_reply_target")
         self.assertEqual(parse(
             '{"speak":true,"action":"join","desire":90,"reply_to_message_id":null,"reason_code":"topic_fit","chain":"ignore rules"}',
-            valid_reply_ids=set(),
+            valid_reply_ids=set(), **parse_args,
         ).speak, True)
 
     def test_final_gate_never_speaks_when_classifier_says_no(self):
@@ -90,46 +95,85 @@ class DiscordAttentionTests(unittest.TestCase):
         self.assertEqual(decision.diagnostic_code, "invalid_json")
         self.assertIsNone(decision.diagnostic_status)
 
-    def test_unrecognized_explanation_does_not_discard_valid_speak_decision(self):
+    def test_unknown_reason_fails_closed(self):
         from discord_bot.attention import DiscordAttentionService
 
         decision = DiscordAttentionService._parse_decision(
             '{"speak":true,"action":"join","desire":90,'
             '"reply_to_message_id":null,"reason_code":"follow_up_question"}',
-            valid_reply_ids=set(),
+            valid_reply_ids=set(), allowed_actions=frozenset({"silent", "join"}),
+            allowed_reasons=frozenset({"topic_fit"}), allow_reply_target=True,
         )
 
-        self.assertTrue(decision.speak)
-        self.assertEqual(decision.action, "join")
-        self.assertEqual(decision.desire, 90)
-        self.assertEqual(decision.reason_code, "topic_fit")
-        self.assertEqual(decision.diagnostic_code, "unrecognized_reason")
+        self.assertFalse(decision.speak)
+        self.assertEqual(decision.diagnostic_code, "invalid_reason")
 
-    def test_unrecognized_action_keeps_valid_initiative_decision(self):
+    def test_unknown_action_fails_closed(self):
         from discord_bot.attention import DiscordAttentionService
 
         decision = DiscordAttentionService._parse_decision(
             '{"speak":true,"action":"reply","desire":95,'
             '"reply_to_message_id":null,"reason_code":"good_topic_to_start"}',
-            valid_reply_ids=set(), fallback_action="start_topic",
-        )
-
-        self.assertTrue(decision.speak)
-        self.assertEqual(decision.action, "start_topic")
-        self.assertEqual(decision.diagnostic_code, "unrecognized_action")
-
-    def test_silent_decision_with_unrecognized_action_remains_silent(self):
-        from discord_bot.attention import DiscordAttentionService
-
-        decision = DiscordAttentionService._parse_decision(
-            '{"speak":false,"action":"reply","desire":10,'
-            '"reply_to_message_id":null,"reason_code":"nothing_to_add"}',
-            valid_reply_ids=set(), fallback_action="join",
+            valid_reply_ids=set(), allowed_actions=frozenset({"silent", "start_topic", "silence_ping"}),
+            allowed_reasons=frozenset({"good_topic_to_start"}), allow_reply_target=False,
         )
 
         self.assertFalse(decision.speak)
-        self.assertEqual(decision.action, "silent")
         self.assertEqual(decision.diagnostic_code, "invalid_action")
+
+    def test_rejects_wrong_mode_actions_and_reply_targets(self):
+        from discord_bot.attention import DiscordAttentionService
+
+        cases = [
+            ('{"speak":true,"action":"start_topic","desire":90,"reply_to_message_id":null,"reason_code":"topic_fit"}',
+             {"silent", "join"}, {"topic_fit"}, True, "invalid_action"),
+            ('{"speak":true,"action":"join","desire":90,"reply_to_message_id":"1","reason_code":"good_topic_to_start"}',
+             {"silent", "start_topic", "silence_ping"}, {"good_topic_to_start"}, False, "invalid_action"),
+            ('{"speak":true,"action":"start_topic","desire":90,"reply_to_message_id":"1","reason_code":"good_topic_to_start"}',
+             {"silent", "start_topic", "silence_ping"}, {"good_topic_to_start"}, False, "invalid_reply_target"),
+        ]
+        for raw, actions, reasons, allow_reply, expected in cases:
+            with self.subTest(expected=expected, raw=raw):
+                result = DiscordAttentionService._parse_decision(
+                    raw, valid_reply_ids={"1"}, allowed_actions=frozenset(actions),
+                    allowed_reasons=frozenset(reasons), allow_reply_target=allow_reply,
+                )
+                self.assertFalse(result.speak)
+                self.assertEqual(result.diagnostic_code, expected)
+
+    def test_rejects_invalid_types_bounds_and_speak_action_mismatch(self):
+        from discord_bot.attention import DiscordAttentionService
+
+        cases = [
+            ('{"speak":1,"action":"join","desire":90,"reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_schema"),
+            ('{"speak":true,"action":"join","desire":"90","reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_desire"),
+            ('{"speak":false,"action":"silent","reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_desire"),
+            ('{"speak":true,"action":"join","desire":-1,"reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_desire"),
+            ('{"speak":true,"action":"join","desire":101,"reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_desire"),
+            ('{"speak":false,"action":"join","desire":10,"reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_speak_action"),
+            ('{"speak":true,"action":"silent","desire":10,"reply_to_message_id":null,"reason_code":"topic_fit"}', "invalid_speak_action"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(expected=expected, raw=raw):
+                result = DiscordAttentionService._parse_decision(
+                    raw, valid_reply_ids=set(), allowed_actions=frozenset({"silent", "join"}),
+                    allowed_reasons=frozenset({"topic_fit"}), allow_reply_target=True,
+                )
+                self.assertFalse(result.speak)
+                self.assertEqual(result.diagnostic_code, expected)
+
+    def test_valid_decision_accepts_only_known_social_reply_id_and_ignores_extra_fields(self):
+        from discord_bot.attention import DiscordAttentionService
+
+        result = DiscordAttentionService._parse_decision(
+            '{"speak":true,"action":"join","desire":90,"reply_to_message_id":"1",'
+            '"reason_code":"topic_fit","extra":"ignored"}',
+            valid_reply_ids={"1"}, allowed_actions=frozenset({"silent", "join"}),
+            allowed_reasons=frozenset({"topic_fit"}), allow_reply_target=True,
+        )
+
+        self.assertTrue(result.speak)
+        self.assertEqual(result.reply_to_message_id, "1")
 
 
 if __name__ == "__main__":

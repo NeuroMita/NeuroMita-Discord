@@ -35,12 +35,15 @@ _EVENT_FIELDS = {
     "presence_send_skipped": {"reason"},
     "presence_send_failed": {"exception_type", "status"},
     "presence_evaluation_failed": {"kind", "exception_type"},
+    "room_observation_skipped": {"reason"},
 }
 _ENUMS = {
     "trigger": {"mention", "reply", "ambient", "slash"},
     "reason": {
         "disabled", "mode_direct", "mode_not_alive", "paused", "generation_busy",
         "attention_busy", "evaluation_cooldown", "voluntary_cooldown", "hourly_budget",
+        "utility_busy", "initiative_budget", "unanswered_backoff", "silence_ping_cooldown",
+        "observation_busy", "observation_room_changed",
         "no_room_activity", "invalid_activity_time", "room_not_quiet", "not_direct",
         "empty_content", "bot_or_webhook", "outside_allowed_location", "attention_silent",
         "desire_below_threshold", "generation_failed", "empty_response", "room_changed",
@@ -53,8 +56,7 @@ _ENUMS = {
     "diagnostic_code": {
         "provider_error", "empty_result", "request_exception", "invalid_json",
         "invalid_schema", "invalid_desire", "invalid_action", "invalid_reason",
-        "invalid_reply_target", "invalid_speak_action", "unrecognized_reason",
-        "unrecognized_action",
+        "invalid_reply_target", "invalid_speak_action", "utility_busy",
     },
 }
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")

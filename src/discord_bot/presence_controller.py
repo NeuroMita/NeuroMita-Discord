@@ -26,6 +26,7 @@ class DiscordPresenceController:
         generate_social: Callable[..., Any], generate_initiative: Callable[..., Any],
         observe_room: Callable[..., Any] | None = None,
         send_public_message: Callable[..., Any], is_generation_busy: Callable[[], bool],
+        is_utility_busy: Callable[[], bool] = lambda: False,
         diagnostics: Any = None,
         guild_id: str, channel_id: str, clock=time.monotonic, rng=None,
         sleep=asyncio.sleep,
@@ -40,6 +41,7 @@ class DiscordPresenceController:
         self.observe_room = observe_room
         self.send_public_message = send_public_message
         self.is_generation_busy = is_generation_busy
+        self.is_utility_busy = is_utility_busy
         self.diagnostics = diagnostics
         self.guild_id = str(guild_id)
         self.channel_id = str(channel_id)
@@ -51,8 +53,12 @@ class DiscordPresenceController:
         self._social_task: asyncio.Task | None = None
         self._initiative_task: asyncio.Task | None = None
         self._summary_task: asyncio.Task | None = None
+        self._observation_task: asyncio.Task | None = None
+        self._observation_revision: int | None = None
+        self._observation_running = False
         self._room_revision = 0
         self._attention_busy = False
+        self._summary_deferred = False
         self._next_summary_retry_at = 0.0
         self._last_attention_at = float("-inf")
         self._last_decision: AttentionDecision | None = None
@@ -76,8 +82,12 @@ class DiscordPresenceController:
             return
         self._closed = True
         tasks = [self._social_task, self._initiative_task, self._summary_task]
+        observation_task = self._observation_task
+        if observation_task is not None:
+            tasks.append(observation_task)
+        self._observation_task = None
         for task in tasks:
-            if task is not None:
+            if task is not None and (task is not observation_task or not self._observation_running):
                 task.cancel()
         await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
         self._started = False
@@ -86,9 +96,13 @@ class DiscordPresenceController:
         if self._closed or not self.timeline.append_message(message):
             return
         self._room_revision += 1
+        self._cancel_pending_observation()
         self.timeline.set_last_seen_message_id(
             guild_id=self.guild_id, channel_id=self.channel_id,
             message_id=message.discord_message_id,
+        )
+        self.timeline.reset_unanswered_initiative(
+            guild_id=self.guild_id, channel_id=self.channel_id,
         )
         self._schedule_summary()
         if direct:
@@ -107,6 +121,7 @@ class DiscordPresenceController:
             message_id=message.discord_message_id,
         )
         self._room_revision += 1
+        self._cancel_pending_observation()
         if self._social_task is not None:
             self._social_task.cancel()
             self._social_task = None
@@ -114,6 +129,7 @@ class DiscordPresenceController:
 
     def notify_direct_generation_started(self) -> None:
         self._room_revision += 1
+        self._cancel_pending_observation()
         if self._social_task is not None:
             self._social_task.cancel()
             self._social_task = None
@@ -123,6 +139,7 @@ class DiscordPresenceController:
 
     async def notify_room_changed(self) -> None:
         self._room_revision += 1
+        self._cancel_pending_observation()
         if self._social_task is not None:
             self._social_task.cancel()
             self._social_task = None
@@ -171,6 +188,8 @@ class DiscordPresenceController:
                 pass
         if self.is_generation_busy():
             return False, "generation_busy"
+        if self.is_utility_busy():
+            return False, "utility_busy"
         if self._attention_busy:
             return False, "attention_busy"
         now = self.clock()
@@ -191,6 +210,33 @@ class DiscordPresenceController:
         if voluntary_count >= settings.max_per_hour:
             return False, "hourly_budget"
         if kind == "initiative":
+            six_hours_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=6)).isoformat()
+            initiative_count = self.timeline.count_initiative_messages_since(
+                guild_id=self.guild_id, channel_id=self.channel_id, since=six_hours_ago,
+            )
+            if initiative_count >= settings.initiative_max_per_6h:
+                return False, "initiative_budget"
+            streak = self.timeline.unanswered_initiative_streak(
+                guild_id=self.guild_id, channel_id=self.channel_id,
+            )
+            last_initiative_at = state.get("last_initiative_at")
+            if streak > 0:
+                if not last_initiative_at:
+                    return False, "unanswered_backoff"
+                required = (
+                    settings.unanswered_backoff_1_seconds if streak == 1 else
+                    settings.unanswered_backoff_2_seconds if streak == 2 else
+                    settings.unanswered_backoff_3_seconds
+                )
+                try:
+                    elapsed = (
+                        dt.datetime.now(dt.timezone.utc)
+                        - dt.datetime.fromisoformat(str(last_initiative_at))
+                    ).total_seconds()
+                    if elapsed < required:
+                        return False, "unanswered_backoff"
+                except (ValueError, TypeError):
+                    return False, "unanswered_backoff"
             last_human = self.timeline.last_human_message(guild_id=self.guild_id, channel_id=self.channel_id)
             if last_human is None:
                 return False, "no_room_activity"
@@ -202,11 +248,13 @@ class DiscordPresenceController:
                 return False, "room_not_quiet"
         return True, "allowed"
 
-    async def _evaluate_social(self, revision: int) -> None:
+    async def _evaluate_social(self, revision: int, *, retry_utility_busy: bool = True) -> None:
         allowed, reason = self._local_gate(kind="social")
         if self.diagnostics is not None:
             self.diagnostics.record("presence_gate", kind="social", allowed=allowed, reason=reason)
         if not allowed:
+            if reason == "utility_busy" and retry_utility_busy and not self._closed:
+                self._social_task = asyncio.create_task(self._retry_social_after_utility(revision))
             return
         self._attention_busy = True
         try:
@@ -230,6 +278,20 @@ class DiscordPresenceController:
             logger.exception("Discord social presence evaluation failed")
         finally:
             self._attention_busy = False
+            self._resume_deferred_summary()
+
+    async def _retry_social_after_utility(self, revision: int) -> None:
+        try:
+            while not self._closed and revision == self._room_revision:
+                await self.sleep(5)
+                if not self.is_utility_busy():
+                    await self._evaluate_social(revision, retry_utility_busy=False)
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._social_task is asyncio.current_task():
+                self._social_task = None
 
     async def _initiative_loop(self) -> None:
         try:
@@ -282,6 +344,7 @@ class DiscordPresenceController:
             logger.exception("Discord initiative evaluation failed")
         finally:
             self._attention_busy = False
+            self._resume_deferred_summary()
 
     def _record_decision(self, decision: AttentionDecision) -> None:
         self._last_attention_at = self.clock()
@@ -322,6 +385,23 @@ class DiscordPresenceController:
                 )
             return False
         request_id = f"discord-{kind}-{uuid.uuid4().hex}"
+        if kind == "initiative" and decision.action == "silence_ping":
+            last_ping = self.timeline.state(
+                guild_id=self.guild_id, channel_id=self.channel_id,
+            ).get("last_silence_ping_at")
+            if last_ping:
+                try:
+                    elapsed = (
+                        dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(str(last_ping))
+                    ).total_seconds()
+                    if elapsed < settings.silence_ping_min_gap_seconds:
+                        if self.diagnostics is not None:
+                            self.diagnostics.record("presence_send_skipped", reason="silence_ping_cooldown")
+                        return False
+                except (ValueError, TypeError):
+                    if self.diagnostics is not None:
+                        self.diagnostics.record("presence_send_skipped", reason="silence_ping_cooldown")
+                    return False
         context = self.context_builder.build()
         if kind == "social":
             response = await self.generate_social(context, request_id)
@@ -360,6 +440,14 @@ class DiscordPresenceController:
             raise
         if sent is not None and self.diagnostics is not None:
             self.diagnostics.record("presence_message_sent", action=decision.action)
+        if (
+            sent is not None and kind == "initiative"
+            and decision.action in {"start_topic", "silence_ping"}
+        ):
+            self.timeline.record_initiative_sent(
+                guild_id=self.guild_id, channel_id=self.channel_id,
+                action=decision.action, created_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            )
         return sent is not None
 
     async def speak_now(self) -> bool:
@@ -369,12 +457,19 @@ class DiscordPresenceController:
         )
 
     async def test_attention(self) -> AttentionDecision:
-        context = self.context_builder.build()
-        decision = await self.run_worker(lambda: self.attention.decide_social(
-            room_context=context, initiative_level=self.settings.get().initiative,
-        ))
-        self._record_decision(decision)
-        return decision
+        if self._attention_busy or self.is_utility_busy():
+            return AttentionDecision(False, "silent", 0, None, "decision_error", "utility_busy")
+        self._attention_busy = True
+        try:
+            context = self.context_builder.build()
+            decision = await self.run_worker(lambda: self.attention.decide_social(
+                room_context=context, initiative_level=self.settings.get().initiative,
+            ))
+            self._record_decision(decision)
+            return decision
+        finally:
+            self._attention_busy = False
+            self._resume_deferred_summary()
 
     def _schedule_summary(self, *, catch_up: bool = False) -> None:
         if self._closed or self._summary_task is not None and not self._summary_task.done():
@@ -388,9 +483,71 @@ class DiscordPresenceController:
             return
         self._summary_task = asyncio.create_task(self.summarize_room())
 
+    def _resume_deferred_summary(self) -> None:
+        if self._summary_deferred and not self._closed and not self._attention_busy:
+            self._summary_deferred = False
+            self._schedule_summary(catch_up=True)
+
+    def _cancel_pending_observation(self) -> None:
+        task = self._observation_task
+        if task is not None and not self._observation_running:
+            task.cancel()
+            self._observation_task = None
+            self._observation_revision = None
+
+    def _schedule_observation(self) -> None:
+        if self._closed or self.observe_room is None:
+            return
+        if self._observation_task is not None and not self._observation_task.done():
+            return
+        revision = self._room_revision
+        self._observation_revision = revision
+        self._observation_task = asyncio.create_task(self._observation_worker(revision))
+
+    async def _observation_worker(self, revision: int) -> None:
+        try:
+            await self.sleep(self.settings.get().observation_idle_seconds)
+            if self._closed:
+                return
+            if revision != self._room_revision or self._observation_revision != revision:
+                if self.diagnostics is not None:
+                    self.diagnostics.record("room_observation_skipped", reason="observation_room_changed")
+                return
+            if self.is_generation_busy() or self._attention_busy or self.is_utility_busy():
+                if self.diagnostics is not None:
+                    self.diagnostics.record("room_observation_skipped", reason="observation_busy")
+                return
+            context = self.context_builder.build()
+            if revision != self._room_revision or self._observation_revision != revision:
+                if self.diagnostics is not None:
+                    self.diagnostics.record("room_observation_skipped", reason="observation_room_changed")
+                return
+            if self.is_generation_busy() or self._attention_busy or self.is_utility_busy():
+                if self.diagnostics is not None:
+                    self.diagnostics.record("room_observation_skipped", reason="observation_busy")
+                return
+            self._observation_running = True
+            observation = await self.observe_room(context, f"discord-observe-{uuid.uuid4().hex}")
+            if observation is None or getattr(observation, "error", ""):
+                logger.warning("Discord room observation did not complete cleanly")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Discord room observation failed")
+        finally:
+            self._observation_running = False
+            if self._observation_task is asyncio.current_task():
+                self._observation_task = None
+                self._observation_revision = None
+
     async def summarize_room(self) -> bool:
         summary_saved = False
+        summary_stale = False
         try:
+            if self._attention_busy or self.is_utility_busy():
+                self._summary_deferred = True
+                return False
+            summary_revision = self._room_revision
             settings = self.settings.get()
             messages = self.timeline.messages_for_summary(
                 guild_id=self.guild_id, channel_id=self.channel_id,
@@ -403,18 +560,17 @@ class DiscordPresenceController:
                 previous_summary=previous, messages=messages,
             ))
             if summary:
-                self.timeline.commit_summary(
-                    guild_id=self.guild_id, channel_id=self.channel_id,
-                    summary=summary, through_row_id=int(messages[-1].row_id or 0),
-                )
-                summary_saved = True
-                self._next_summary_retry_at = 0.0
-                if self.observe_room is not None and not self.is_generation_busy():
-                    observation = await self.observe_room(
-                        self.context_builder.build(), f"discord-observe-{uuid.uuid4().hex}",
+                if summary_revision == self._room_revision:
+                    self.timeline.commit_summary(
+                        guild_id=self.guild_id, channel_id=self.channel_id,
+                        summary=summary, through_row_id=int(messages[-1].row_id or 0),
                     )
-                    if observation is None or getattr(observation, "error", ""):
-                        logger.warning("Discord room observation did not complete cleanly")
+                    summary_saved = True
+                    self._next_summary_retry_at = 0.0
+                    self._schedule_observation()
+                else:
+                    summary_stale = True
+                    self._next_summary_retry_at = 0.0
             else:
                 self._next_summary_retry_at = self.clock() + 600.0
         except asyncio.CancelledError:
@@ -424,7 +580,7 @@ class DiscordPresenceController:
             self._next_summary_retry_at = self.clock() + 600.0
         finally:
             self._summary_task = None
-            if summary_saved and not self._closed and self.timeline.count_unsummarized(
+            if (summary_saved or summary_stale) and not self._closed and self.timeline.count_unsummarized(
                 guild_id=self.guild_id, channel_id=self.channel_id,
             ) > self.context_builder.recent_limit:
                 self._schedule_summary(catch_up=True)
@@ -434,18 +590,34 @@ class DiscordPresenceController:
         settings = self.settings.get()
         state = self.timeline.state(guild_id=self.guild_id, channel_id=self.channel_id)
         decision = self._last_decision
+        one_hour_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+        six_hours_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=6)).isoformat()
         return {
             "enabled": settings.enabled,
             "mode": settings.mode,
             "initiative": settings.initiative,
             "cooldown_seconds": settings.cooldown_seconds,
             "max_per_hour": settings.max_per_hour,
+            "voluntary_1h_count": self.timeline.count_mita_messages_since(
+                guild_id=self.guild_id, channel_id=self.channel_id, since=one_hour_ago,
+            ),
+            "initiative_max_per_6h": settings.initiative_max_per_6h,
+            "initiative_6h_count": self.timeline.count_initiative_messages_since(
+                guild_id=self.guild_id, channel_id=self.channel_id, since=six_hours_ago,
+            ),
+            "unanswered_streak": self.timeline.unanswered_initiative_streak(
+                guild_id=self.guild_id, channel_id=self.channel_id,
+            ),
+            "last_initiative_at": state.get("last_initiative_at"),
+            "last_silence_ping_at": state.get("last_silence_ping_at"),
             "messages_seen": self.timeline.count_messages(guild_id=self.guild_id, channel_id=self.channel_id),
             "last_attention_action": decision.action if decision else state.get("last_attention_action", ""),
             "last_attention_reason": decision.reason_code if decision else state.get("last_attention_reason", ""),
             "paused_until": state.get("pause_until"),
             "attention_busy": self._attention_busy,
+            "utility_busy": self.is_utility_busy(),
             "generation_busy": self.is_generation_busy(),
+            "observation_busy": self._observation_task is not None and not self._observation_task.done(),
         }
 
     def set_pause(self, minutes: int | None) -> None:
@@ -457,6 +629,7 @@ class DiscordPresenceController:
         )
 
     def clear_room(self) -> int:
+        self._cancel_pending_observation()
         if self._social_task is not None:
             self._social_task.cancel()
             self._social_task = None

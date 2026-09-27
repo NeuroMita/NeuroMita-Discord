@@ -23,6 +23,12 @@ class PresenceSettings:
     summary_threshold: int = 80
     summary_keep_recent: int = 30
     summary_max_batch: int = 50
+    initiative_max_per_6h: int = 2
+    unanswered_backoff_1_seconds: int = 7200
+    unanswered_backoff_2_seconds: int = 14400
+    unanswered_backoff_3_seconds: int = 21600
+    silence_ping_min_gap_seconds: int = 7200
+    observation_idle_seconds: int = 60
 
 
 class PresenceSettingsStore:
@@ -44,8 +50,20 @@ class PresenceSettingsStore:
             ("max_per_hour", 0, 20), ("evaluation_min_interval_seconds", 60, 3600),
             ("quiet_start_seconds", 180, 86400), ("summary_threshold", 20, 1000),
             ("summary_keep_recent", 5, 100), ("summary_max_batch", 5, 100),
+            ("initiative_max_per_6h", 0, 20),
+            ("unanswered_backoff_1_seconds", 300, 86400),
+            ("unanswered_backoff_2_seconds", 300, 172800),
+            ("unanswered_backoff_3_seconds", 300, 259200),
+            ("silence_ping_min_gap_seconds", 300, 259200),
+            ("observation_idle_seconds", 10, 3600),
         ):
             clean[key] = max(lower, min(upper, int(clean[key])))
+        clean["unanswered_backoff_2_seconds"] = max(
+            clean["unanswered_backoff_1_seconds"], clean["unanswered_backoff_2_seconds"],
+        )
+        clean["unanswered_backoff_3_seconds"] = max(
+            clean["unanswered_backoff_2_seconds"], clean["unanswered_backoff_3_seconds"],
+        )
         clean["debounce_min_seconds"] = max(1.0, min(60.0, float(clean["debounce_min_seconds"])))
         clean["debounce_max_seconds"] = max(
             clean["debounce_min_seconds"], min(120.0, float(clean["debounce_max_seconds"]))

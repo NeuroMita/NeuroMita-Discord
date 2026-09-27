@@ -213,6 +213,7 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = 0
                 self.started = threading.Event()
+                self.finished = threading.Event()
                 self.release = threading.Event()
                 self.thread_ids = []
                 self.close_calls = 0
@@ -224,10 +225,13 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
                 self.generate_args.append((text, sender, request_id))
                 self.thread_ids.append(threading.get_ident())
                 self.started.set()
-                if self.raise_error:
-                    raise RuntimeError("provider details must stay server-side")
-                self.release.wait(timeout=2)
-                return type("Response", (), {"text": "ok", "error_message": ""})()
+                try:
+                    if self.raise_error:
+                        raise RuntimeError("provider details must stay server-side")
+                    self.release.wait(timeout=2)
+                    return type("Response", (), {"text": "ok", "error_message": ""})()
+                finally:
+                    self.finished.set()
 
             def close(self):
                 self.close_calls += 1
@@ -252,6 +256,38 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.runtime.thread_ids[0], loop_thread)
         self.assertEqual(self.runtime.generate_args[0], ("hello", "Discord:Tester [id:1]", "2"))
 
+    async def test_blocked_utility_worker_does_not_block_character_generation(self):
+        utility_started = threading.Event()
+        utility_release = threading.Event()
+        utility_threads = []
+
+        def utility_work():
+            utility_threads.append(threading.get_ident())
+            utility_started.set()
+            utility_release.wait(timeout=2)
+
+        utility_task = asyncio.create_task(self.bot._run_presence_worker(utility_work))
+        await asyncio.to_thread(utility_started.wait, 1)
+        from discord_bot.bot import UtilityBusyError
+        queued_started = threading.Event()
+        with self.assertRaises(UtilityBusyError):
+            await self.bot._run_presence_worker(queued_started.set)
+        self.assertFalse(queued_started.is_set())
+        generation_task = asyncio.create_task(
+            self.bot._generate("hello", sender="Discord:Tester [id:1]", request_id="3")
+        )
+        try:
+            generation_started = await asyncio.wait_for(
+                asyncio.to_thread(self.runtime.started.wait, 1), timeout=1.2,
+            )
+            self.assertTrue(generation_started)
+            self.assertNotEqual(utility_threads[0], self.runtime.thread_ids[-1])
+        finally:
+            self.runtime.release.set()
+            utility_release.set()
+        await generation_task
+        await utility_task
+
     async def test_busy_generation_is_rejected_without_queueing(self):
         from discord_bot.bot import GenerationBusyError
 
@@ -269,6 +305,51 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.1)
         self.assertEqual(self.runtime.calls, 1)
 
+    async def test_cancelled_generation_remains_busy_until_worker_finishes(self):
+        from discord_bot.bot import GenerationBusyError
+
+        running = asyncio.create_task(
+            self.bot._generate("first", sender="Discord:Tester [id:1]", request_id="1")
+        )
+        await asyncio.to_thread(self.runtime.started.wait, 1)
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        self.assertTrue(self.bot.generation_busy)
+        with self.assertRaises(GenerationBusyError):
+            await self.bot._generate("second", sender="Discord:Tester [id:1]", request_id="2")
+
+        self.runtime.release.set()
+        await asyncio.to_thread(self.runtime.finished.wait, 1)
+        self.assertFalse(self.bot.generation_busy)
+
+    async def test_cancelled_utility_remains_busy_until_worker_finishes(self):
+        utility_started = threading.Event()
+        utility_finished = threading.Event()
+        utility_release = threading.Event()
+
+        def utility_work():
+            utility_started.set()
+            utility_release.wait(timeout=2)
+            utility_finished.set()
+
+        running = asyncio.create_task(self.bot._run_presence_worker(utility_work))
+        await asyncio.to_thread(utility_started.wait, 1)
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        self.assertTrue(self.bot.utility_busy)
+        from discord_bot.bot import UtilityBusyError
+        with self.assertRaises(UtilityBusyError):
+            await self.bot._run_presence_worker(lambda: None)
+
+        utility_release.set()
+        await asyncio.to_thread(utility_finished.wait, 1)
+        await asyncio.sleep(0)
+        self.assertFalse(self.bot.utility_busy)
+
     async def test_generation_exception_is_logged_with_traceback_and_hidden_from_user(self):
         self.runtime.raise_error = True
         with self.assertLogs("discord_bot.bot", level="ERROR") as captured:
@@ -285,11 +366,14 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shutdown_closes_executor_and_runtime_only_once(self):
         shutdown = self.bot._generation_executor.shutdown
-        with patch.object(self.bot._generation_executor, "shutdown", wraps=shutdown) as mocked:
+        utility_shutdown = self.bot._utility_executor.shutdown
+        with patch.object(self.bot._generation_executor, "shutdown", wraps=shutdown) as mocked, \
+             patch.object(self.bot._utility_executor, "shutdown", wraps=utility_shutdown) as utility_mocked:
             await self.bot.close()
             await self.bot.close()
 
         self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(utility_mocked.call_count, 1)
         self.assertEqual(self.runtime.close_calls, 1)
 
     async def test_admin_commands_are_registered_and_restricted_to_configured_owner(self):

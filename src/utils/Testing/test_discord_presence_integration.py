@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 sys.path.insert(0, os.path.abspath("src"))
 
@@ -20,6 +20,59 @@ class AsyncContext:
 
 
 class DiscordPresenceIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_ask_excludes_its_input_from_ambient_context(self):
+        from discord_bot.bot import DiscordBot
+        from discord_bot.room_timeline import RoomMessage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            class Runtime:
+                data_dir = Path(tmp)
+                active_character_id = "Crazy"
+                settings = SimpleNamespace(get=lambda *_args: None)
+
+                def __init__(self):
+                    self.calls = []
+
+                def generate_utility(self, _request):
+                    raise AssertionError("not used by direct chat")
+
+                def generate(self, text, **kwargs):
+                    self.calls.append((text, kwargs))
+                    return SimpleNamespace(text="reply", error="", error_message="")
+
+                def close(self):
+                    pass
+
+            runtime = Runtime()
+            bot = DiscordBot(token="test", runtime=runtime)
+            bot.room_timeline.append_message(RoomMessage(
+                discord_message_id="older", guild_id=str(bot.config.guild_id),
+                channel_id=str(bot.config.channel_id), author_id="11", author_name="A",
+                author_kind="human", content="previous room message",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ))
+            user = SimpleNamespace(id=11, name="A", display_name="A", global_name="A")
+            interaction = SimpleNamespace(
+                id=101, guild_id=bot.config.guild_id, channel_id=bot.config.channel_id,
+                user=user,
+                response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+                edit_original_response=AsyncMock(return_value=SimpleNamespace(
+                    id=102, guild=SimpleNamespace(id=bot.config.guild_id),
+                    channel=SimpleNamespace(id=bot.config.channel_id), author=user,
+                    content="reply", created_at=datetime.now(timezone.utc),
+                )),
+            )
+            try:
+                await bot.tree.get_command("chat").get_command("ask").callback(
+                    interaction, text="unique slash input",
+                )
+                text, request = runtime.calls[0]
+                self.assertEqual(text, "unique slash input")
+                self.assertIn("previous room message", request["ambient_context"])
+                self.assertNotIn("unique slash input", request["ambient_context"])
+            finally:
+                await bot.close()
+
     async def test_mention_uses_character_runtime_and_records_both_room_speakers(self):
         from discord_bot.bot import DiscordBot
 

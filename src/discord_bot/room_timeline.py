@@ -66,16 +66,36 @@ class DiscordRoomTimeline:
                 last_attention_at TEXT,
                 last_attention_action TEXT,
                 last_attention_reason TEXT,
+                unanswered_initiative_streak INTEGER NOT NULL DEFAULT 0,
+                last_initiative_at TEXT,
+                last_silence_ping_at TEXT,
                 updated_at TEXT NOT NULL DEFAULT ''
             );
             """
         )
         self._db.commit()
+        self._ensure_room_state_columns()
         if os.name != "nt":
             try:
                 os.chmod(self.path, 0o600)
             except OSError:
                 pass
+
+    def _ensure_room_state_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._db.execute("PRAGMA table_info(room_state)").fetchall()
+        }
+        additions = {
+            "unanswered_initiative_streak":
+                "INTEGER NOT NULL DEFAULT 0",
+            "last_initiative_at": "TEXT",
+            "last_silence_ping_at": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE room_state ADD COLUMN {name} {declaration}")
+        self._db.commit()
 
     @staticmethod
     def _room_key(guild_id: str, channel_id: str) -> str:
@@ -287,6 +307,50 @@ class DiscordRoomTimeline:
             ).fetchone()
         return int(row["n"])
 
+    def count_initiative_messages_since(self, *, guild_id: str, channel_id: str, since: str) -> int:
+        with self._lock:
+            row = self._db.execute(
+                """SELECT COUNT(*) AS n FROM room_messages WHERE guild_id=? AND channel_id=?
+                   AND author_kind='mita' AND message_kind IN ('mita_start_topic','mita_silence_ping')
+                   AND is_deleted=0 AND created_at>=?""",
+                (str(guild_id), str(channel_id), str(since)),
+            ).fetchone()
+        return int(row["n"])
+
+    def unanswered_initiative_streak(self, *, guild_id: str, channel_id: str) -> int:
+        with self._lock:
+            state = self._state(guild_id, channel_id)
+            return int(state["unanswered_initiative_streak"] or 0) if state else 0
+
+    def record_initiative_sent(
+        self, *, guild_id: str, channel_id: str, action: str, created_at: str,
+    ) -> None:
+        import datetime
+
+        room_key = self._room_key(str(guild_id), str(channel_id))
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO room_state(room_key) VALUES(?)", (room_key,))
+            self._db.execute(
+                """UPDATE room_state SET unanswered_initiative_streak=unanswered_initiative_streak+1,
+                   last_initiative_at=?, last_silence_ping_at=CASE WHEN ?='silence_ping'
+                   THEN ? ELSE last_silence_ping_at END, updated_at=? WHERE room_key=?""",
+                (str(created_at), str(action), str(created_at),
+                 datetime.datetime.now(datetime.timezone.utc).isoformat(), room_key),
+            )
+            self._db.commit()
+
+    def reset_unanswered_initiative(self, *, guild_id: str, channel_id: str) -> None:
+        import datetime
+
+        room_key = self._room_key(str(guild_id), str(channel_id))
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO room_state(room_key) VALUES(?)", (room_key,))
+            self._db.execute(
+                "UPDATE room_state SET unanswered_initiative_streak=0, updated_at=? WHERE room_key=?",
+                (datetime.datetime.now(datetime.timezone.utc).isoformat(), room_key),
+            )
+            self._db.commit()
+
     def human_messages_after(self, *, guild_id: str, channel_id: str, row_id: int) -> int:
         with self._lock:
             row = self._db.execute(
@@ -304,7 +368,10 @@ class DiscordRoomTimeline:
     def update_presence_state(self, *, guild_id: str, channel_id: str, **values: Any) -> None:
         import datetime
 
-        allowed = {"pause_until", "last_attention_at", "last_attention_action", "last_attention_reason"}
+        allowed = {
+            "pause_until", "last_attention_at", "last_attention_action", "last_attention_reason",
+            "last_initiative_at", "last_silence_ping_at", "unanswered_initiative_streak",
+        }
         updates = {key: value for key, value in values.items() if key in allowed}
         if not updates:
             return

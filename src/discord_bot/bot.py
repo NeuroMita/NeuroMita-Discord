@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,10 @@ BUSY_REPLY = "A request is already running. Please try again shortly."
 
 class GenerationBusyError(RuntimeError):
     """Raised when the single Discord generation slot is occupied."""
+
+
+class UtilityBusyError(RuntimeError):
+    """Raised instead of queueing unbounded Discord utility work."""
 
 
 def extract_mention_prompt(content: str, bot_id: int) -> str | None:
@@ -120,7 +125,11 @@ class DiscordBot(commands.Bot):
         self._generation_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="discord-generation"
         )
-        self._generation_busy = False
+        self._utility_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="discord-utility"
+        )
+        self._generation_busy = threading.Event()
+        self._utility_busy = threading.Event()
         self._closed = False
         self._managed_run = False
         self.presence = None
@@ -152,7 +161,8 @@ class DiscordBot(commands.Bot):
                 generate_initiative=self._generate_initiative,
                 observe_room=self._observe_room,
                 send_public_message=self._send_presence_message,
-                is_generation_busy=lambda: self._generation_busy,
+                is_generation_busy=lambda: self.generation_busy,
+                is_utility_busy=lambda: self.utility_busy,
                 diagnostics=self.diagnostics,
                 guild_id=str(guild_id),
                 channel_id=str(channel_id),
@@ -198,7 +208,10 @@ class DiscordBot(commands.Bot):
                     text,
                     sender=discord_sender(interaction.user),
                     request_id=str(interaction.id),
-                    ambient_context=(self.presence.context_builder.build() if self.presence else ""),
+                    ambient_context=(
+                        self.presence.context_builder.build(exclude_message_ids={str(interaction.id)})
+                        if self.presence else ""
+                    ),
                 )
             except GenerationBusyError:
                 await interaction.edit_original_response(content=BUSY_REPLY)
@@ -759,8 +772,31 @@ class DiscordBot(commands.Bot):
         await self.presence.notify_room_changed()
 
     async def _run_presence_worker(self, function):
+        if self._utility_busy.is_set():
+            raise UtilityBusyError("Discord utility worker is occupied")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._generation_executor, function)
+        self._utility_busy.set()
+
+        def run_utility():
+            try:
+                return function()
+            finally:
+                self._utility_busy.clear()
+
+        try:
+            future = loop.run_in_executor(self._utility_executor, run_utility)
+        except BaseException:
+            self._utility_busy.clear()
+            raise
+        return await future
+
+    @property
+    def generation_busy(self) -> bool:
+        return self._generation_busy.is_set()
+
+    @property
+    def utility_busy(self) -> bool:
+        return self._utility_busy.is_set()
 
     async def _generate_social(self, ambient_context: str, request_id: str):
         return await self._generate(
@@ -836,19 +872,28 @@ class DiscordBot(commands.Bot):
         system_input: str = "",
         event_type: str = "chat",
     ) -> Any:
-        if self._generation_busy:
+        if self._generation_busy.is_set():
             raise GenerationBusyError
-        self._generation_busy = True
+        self._generation_busy.set()
         loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                self._generation_executor,
-                lambda: self._run_character_generation(
+
+        def run_generation():
+            try:
+                return self._run_character_generation(
                     text, sender=sender, request_id=request_id,
                     ambient_context=ambient_context, system_input=system_input,
                     event_type=event_type,
-                ),
-            )
+                )
+            finally:
+                self._generation_busy.clear()
+
+        try:
+            future = loop.run_in_executor(self._generation_executor, run_generation)
+        except BaseException:
+            self._generation_busy.clear()
+            raise
+        try:
+            return await future
         except Exception as exc:
             logger.exception("Discord LLM generation raised an exception")
             if self.diagnostics is not None:
@@ -857,8 +902,6 @@ class DiscordBot(commands.Bot):
             if callable(record_error):
                 record_error("Generation raised an exception; details are in server logs.")
             return None
-        finally:
-            self._generation_busy = False
 
     def _run_character_generation(
         self, text: str, *, sender: str, request_id: str,
@@ -911,6 +954,7 @@ class DiscordBot(commands.Bot):
             await super().close()
         finally:
             self._generation_executor.shutdown(wait=True, cancel_futures=True)
+            self._utility_executor.shutdown(wait=True, cancel_futures=True)
             if self.room_timeline is not None:
                 self.room_timeline.close()
             try:

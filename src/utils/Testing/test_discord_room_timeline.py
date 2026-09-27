@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -77,6 +78,70 @@ class DiscordRoomTimelineTests(unittest.TestCase):
         self.assertEqual(self.timeline.get_summary(guild_id="1", channel_id="2"), "")
         self.assertEqual(self.timeline.summary_through_row_id(guild_id="1", channel_id="2"), 0)
         self.assertEqual([m.content for m in self.timeline.recent(guild_id="1", channel_id="2")], ["2", "3", "4"])
+
+    def test_old_room_state_schema_migrates_without_losing_summary(self):
+        path = Path(self.temp.name) / "old-room.sqlite3"
+        self.timeline.close()
+        db = sqlite3.connect(path)
+        try:
+            db.execute("""CREATE TABLE room_state (
+                room_key TEXT PRIMARY KEY, summary TEXT NOT NULL DEFAULT '',
+                summary_through_row_id INTEGER NOT NULL DEFAULT 0,
+                last_seen_discord_message_id TEXT, pause_until TEXT,
+                last_attention_at TEXT, last_attention_action TEXT,
+                last_attention_reason TEXT, updated_at TEXT NOT NULL DEFAULT ''
+            )""")
+            db.execute(
+                "INSERT INTO room_state(room_key,summary,summary_through_row_id) VALUES(?,?,?)",
+                ("1:2", "keep this summary", 17),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        from discord_bot.room_timeline import DiscordRoomTimeline
+        self.timeline = DiscordRoomTimeline(path)
+        state = self.timeline.state(guild_id="1", channel_id="2")
+
+        self.assertEqual(state["summary"], "keep this summary")
+        self.assertEqual(state["summary_through_row_id"], 17)
+        self.assertEqual(state["unanswered_initiative_streak"], 0)
+        self.assertIsNone(state["last_initiative_at"])
+        self.assertIsNone(state["last_silence_ping_at"])
+
+    def test_initiative_count_and_streak_track_only_sent_autonomous_kinds(self):
+        since = "2026-09-27T00:00:00+00:00"
+        self.timeline.append_message(self.message(1, "start", kind="mita", created_at=since))
+        self.timeline.append_message(self.message(2, "ping", kind="mita", created_at=since))
+        self.timeline.append_message(self.message(3, "social", kind="mita", created_at=since))
+        db = sqlite3.connect(self.timeline.path)
+        try:
+            db.execute("UPDATE room_messages SET message_kind='mita_start_topic' WHERE discord_message_id='1'")
+            db.execute("UPDATE room_messages SET message_kind='mita_silence_ping' WHERE discord_message_id='2'")
+            db.execute("UPDATE room_messages SET message_kind='mita_join' WHERE discord_message_id='3'")
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(self.timeline.count_initiative_messages_since(
+            guild_id="1", channel_id="2", since=since,
+        ), 2)
+
+        self.timeline.record_initiative_sent(
+            guild_id="1", channel_id="2", action="start_topic", created_at="2026-09-27T00:01:00+00:00",
+        )
+        self.timeline.record_initiative_sent(
+            guild_id="1", channel_id="2", action="silence_ping", created_at="2026-09-27T00:02:00+00:00",
+        )
+        self.assertEqual(self.timeline.unanswered_initiative_streak(guild_id="1", channel_id="2"), 2)
+        self.assertEqual(self.timeline.state(guild_id="1", channel_id="2")["last_silence_ping_at"],
+                         "2026-09-27T00:02:00+00:00")
+
+        self.timeline.reset_unanswered_initiative(guild_id="1", channel_id="2")
+        state = self.timeline.state(guild_id="1", channel_id="2")
+        self.assertEqual(state["unanswered_initiative_streak"], 0)
+        self.assertEqual(state["last_initiative_at"], "2026-09-27T00:02:00+00:00")
+        self.assertEqual(state["last_silence_ping_at"], "2026-09-27T00:02:00+00:00")
 
 
 if __name__ == "__main__":
