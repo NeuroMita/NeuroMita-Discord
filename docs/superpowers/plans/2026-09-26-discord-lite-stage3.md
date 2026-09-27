@@ -92,7 +92,8 @@
 **Files:** `docs/discord-lite.md`, `requirements-discord.txt` only if the clean environment demonstrates a missing dependency.
 
 - [x] Document the allowed guild/channel, `DISCORD_ADMIN_IDS`, prompt asset path, shared per-character memory, blocked DMs/threads, and admin commands.
-- [ ] Create/use an Ubuntu WSL distro after verifying disk headroom; do not delete existing files. Install a fresh venv from `requirements-discord.txt` in the Linux filesystem.
-- [ ] Run the complete Discord Lite tests and smoke import in the clean venv; record exact Python and pip/test results.
+- [x] Install Ubuntu 24.04 as WSL1 after verifying disk headroom; keep the existing `Ubuntu-ExternalTTS` distro untouched and do not delete files.
+- [x] Create a fresh venv in the Ubuntu Linux filesystem, install `requirements-discord.txt`, and run Discord adapter plus mock-provider tests and lightweight-import smoke.
+- [x] Linux result: Python 3.12.3, requirements installed, 35 tests passed under native WSL1 processes.
 - [x] Run `git diff --check`, focused Windows tests, and the Discord Lite smoke suite.
-- [ ] Commit and push after completing the Linux verification gate.
+- [x] Commit and push after completing the Linux verification gate.

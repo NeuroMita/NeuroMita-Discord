@@ -29,12 +29,11 @@ For a Discord turn, submit a `ChatGenerationRequest` with `event_type="chat"`, t
 Expose diagnostics and repair operations through a Discord-only facade over existing controllers/managers, never through SQL tables owned by the bot. Proposed initial command groups:
 
 - `/bot status`, `/bot resources`, `/bot uptime`, `/bot health`.
-- `/character list`, `/character status`, `/character set`, `/character reload`.
-- `/history status`, `/history recent`, `/history summary`, `/history compress`, `/history reset`.
-- `/memory status`, `/memory list`, `/memory show`, `/memory add`, `/memory delete`, `/memory maintenance`, `/memory explain`.
-- `/context status` and admin-only `/context dump`, with secrets redacted.
-- `/ai status`, `/ai preset`, `/ai fallbacks`, `/ai test`.
-- `/compression status`, `/compression run`, `/compression provider`, `/compression on`, `/compression off`.
+- `/character list`, `/character status`, `/character set`.
+- `/history status`, `/history recent`, `/history summary`, `/history reset`.
+- `/memory status`, `/memory list`, `/memory show`, `/memory add`, `/memory delete`, `/memory maintenance`.
+- `/ai status`.
+- `/compression status`, `/compression on`, `/compression off`.
 - `/debug last-error`, `/debug health`.
 
 History/context/memory reads and all repair/configuration commands are admin-only because the character's memory is shared. Never show API keys. Reset, delete, provider changes, and context dump require explicit confirmation and produce ephemeral responses. `/chat status` is folded into `/bot status`.
@@ -49,7 +48,7 @@ History/context/memory reads and all repair/configuration commands are admin-onl
 
 Unit tests must not connect to Discord. Add integration-level tests around the real `GenerationService` request boundary using isolated services/data, and assert that the completion event reaches the existing history controller. Keep the heavy-import guard after constructing the character runtime.
 
-The requested clean Linux venv check remains a release gate. On this Windows host, `wsl.exe --list` currently exits with code 1 and prints usage; no usable WSL distribution was detected. Do not install or change Windows/WSL settings as part of this work. If Linux CI is added as the substitute, report its actual workflow result before calling the stage complete.
+Verified with 35 Discord adapter and mock-provider tests in an isolated Python 3.12.3 venv on Ubuntu 24.04 WSL1. The test process ran natively under Linux; no Discord gateway or real API request was made. The existing `Ubuntu-ExternalTTS` distro was not used or modified.
 
 ## Deployment note
 

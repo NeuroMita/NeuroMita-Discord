@@ -195,10 +195,11 @@ class DiscordCharacterRuntime:
             character = self._controllers["character"].get_current_ref()
         raw_prompt_path = str(getattr(character, "base_data_path", "") or "")
         prompt_path = Path(raw_prompt_path) if raw_prompt_path else None
+        main_template = prompt_path / "main_template.txt" if prompt_path else None
         prompt_available = bool(
-            prompt_path is not None
-            and prompt_path.is_dir()
-            and any(prompt_path.iterdir())
+            main_template is not None
+            and main_template.is_file()
+            and main_template.stat().st_size > 0
         )
         character_id = str(getattr(character, "char_id", "") or "")
         message = (

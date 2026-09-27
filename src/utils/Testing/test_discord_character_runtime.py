@@ -137,6 +137,32 @@ print('character runtime lightweight bootstrap OK')
 
         self.assertEqual(status["state"], "degraded")
         self.assertFalse(status["prompt_assets_available"])
+
+    def test_status_does_not_treat_runtime_generated_files_as_prompt_assets(self):
+        from discord_bot.character_runtime import DiscordCharacterRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / "Crazy" / "Default"
+            prompt_path.mkdir(parents=True)
+            (prompt_path / "variables.json").write_text("{}", encoding="utf-8")
+            runtime = DiscordCharacterRuntime.__new__(DiscordCharacterRuntime)
+            runtime._started = True
+            runtime._closed = False
+            runtime.data_dir = Path(directory)
+            runtime.prompts_dir = Path(directory)
+            runtime._controllers = {"character": Mock()}
+            character = Mock()
+            character.char_id = "Crazy"
+            character.prompt_set_name = "Default"
+            character.base_data_path = str(prompt_path)
+            runtime._controllers["character"].get_current_ref.return_value = character
+            runtime._base_runtime = Mock()
+            runtime._base_runtime.settings.get.side_effect = lambda key, default=None: default
+
+            status = runtime.status()
+
+        self.assertEqual(status["state"], "degraded")
+        self.assertFalse(status["prompt_assets_available"])
         self.assertIn("prompt", status["message"].lower())
 
 
