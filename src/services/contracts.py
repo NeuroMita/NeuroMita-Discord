@@ -752,6 +752,8 @@ class ChatGenerationRequest:
     gm_instruction_override: Optional[str] = None
     trace_id: Optional[str] = None
     cancellation: Optional[CancellationToken] = None
+    hidden_user_context: str = ""
+    generation_params_override: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -788,6 +790,7 @@ class UtilityGenerationRequest:
     max_attempts: int = 1
     retry_delay: float = 0.0
     request_timeout: float = 240.0
+    generation_params_override: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

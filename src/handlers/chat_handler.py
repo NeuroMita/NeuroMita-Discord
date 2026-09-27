@@ -20,7 +20,7 @@ from utils.openrouter_routing import (
     build_openrouter_session_id,
     normalize_openrouter_routing,
 )
-from handlers.llm_providers.param_mapper import build_unified_generation_params
+from handlers.llm_providers.param_mapper import build_unified_generation_params, merge_generation_params
 
 from core.events import get_event_bus
 from core.cancellation import OperationCancelledError
@@ -268,6 +268,7 @@ class ChatModel:
         request_timeout = float(request_options.get("request_timeout", 240) or 240)
         suppress_failure_events = bool(request_options.get("suppress_failure_events", False))
         cancellation = request_options.get("cancellation")
+        generation_params_override = request_options.get("generation_params_override")
 
         self._log_generation_start(preset_id)
 
@@ -278,6 +279,9 @@ class ChatModel:
 
             native_parameters = getattr(preset_settings, "native_parameters", None)
             if native_parameters is not None:
+                native_parameters = merge_generation_params(
+                    native_parameters, generation_params_override,
+                )
                 params = {}
             else:
                 params = build_unified_generation_params(
@@ -295,6 +299,7 @@ class ChatModel:
                     gemini_thinking_budget=getattr(cfg, "gemini_thinking_budget", None),
                     force_params=getattr(cfg, "preset_forced_params", frozenset()),
                 )
+                params = merge_generation_params(params, generation_params_override)
             if request_id:
                 params["request_id"] = str(request_id)
 

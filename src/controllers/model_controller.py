@@ -1258,6 +1258,7 @@ class ModelController(GenerationService, ModelStateService):
                     "retry_delay": request.retry_delay,
                     "request_timeout": request.request_timeout,
                     "suppress_failure_events": True,
+                    "generation_params_override": request.generation_params_override,
                 },
             )
             if result and result.text:
@@ -1558,7 +1559,10 @@ class ModelController(GenerationService, ModelStateService):
                 "Describe the drawing itself and any depicted characters or objects."
             )
 
-        hidden_user_context = ""
+        hidden_context_parts: list[str] = []
+        request_hidden_context = str(request.hidden_user_context or "").strip()
+        if request_hidden_context:
+            hidden_context_parts.append(request_hidden_context)
 
         if image_data and bool(self.settings.get("IMAGE_DESCRIPTION_ENABLED", False)):
             _detail = str(self.settings.get("IMAGE_DESCRIPTION_DETAIL", "normal") or "normal")
@@ -1590,7 +1594,9 @@ class ModelController(GenerationService, ModelStateService):
                     with perf_span(trace_id, "generation.image_description", mode="sequence"):
                         seq_desc = self.image_description_handler.describe_sequence(image_data, context_hint=_image_context_hint)
                     if seq_desc and not seq_desc.startswith("["):
-                        hidden_user_context = f"[Hidden image context]\n{_ctx_preamble_seq}\n[Scene: {seq_desc}]"
+                        hidden_context_parts.append(
+                            f"[Hidden image context]\n{_ctx_preamble_seq}\n[Scene: {seq_desc}]"
+                        )
                         image_descriptions = {_detail: seq_desc}
                         logger.info(f"[ModelController] Non-native sequence mode: {len(image_data)} frames described as one scene.")
                 else:
@@ -1600,7 +1606,9 @@ class ModelController(GenerationService, ModelStateService):
                         desc_text = "\n".join(
                             f"[Image {i + 1}: {d}]" for i, d in enumerate(descriptions)
                         )
-                        hidden_user_context = f"[Hidden image context]\n{_ctx_preamble_single}\n{desc_text}"
+                        hidden_context_parts.append(
+                            f"[Hidden image context]\n{_ctx_preamble_single}\n{desc_text}"
+                        )
                         image_descriptions = {_detail: "\n".join(descriptions)}
                         logger.info(f"[ModelController] Non-native image mode: replaced {len(descriptions)} image(s) with text descriptions.")
                 image_data = []  # don't send images to main model
@@ -1615,7 +1623,7 @@ class ModelController(GenerationService, ModelStateService):
             system_input=system_input,
             rag_context=rag_context,
             core_memory_context=core_memory_context_text,
-            hidden_user_context=hidden_user_context,
+            hidden_user_context="\n\n".join(hidden_context_parts),
             image_data=image_data,
             memory_limit=memory_limit,
             is_game_master=is_game_master,
@@ -1720,6 +1728,7 @@ class ModelController(GenerationService, ModelStateService):
                     request_options_override={
                         "trace_id": trace_id,
                         "cancellation": request.cancellation,
+                        "generation_params_override": request.generation_params_override,
                         "failure_context": {
                             "message_id": ConversationMessageIds.incoming(req_id) if req_id else "",
                             "character_id": char_id,

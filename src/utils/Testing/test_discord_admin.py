@@ -53,6 +53,19 @@ class MemoryListTests(unittest.TestCase):
 
 
 class DiscordAdminFacadeTests(unittest.TestCase):
+    def test_character_reset_all_requires_confirmation_and_reports_destructive_event(self):
+        from discord_bot.admin_facade import DiscordAdminFacade
+        from core.events import Events
+
+        runtime = Mock()
+        runtime.event_bus.emit.return_value = True
+        facade = DiscordAdminFacade(runtime)
+
+        self.assertFalse(facade.character_reset_all(confirm=False))
+        runtime.event_bus.emit.assert_not_called()
+        self.assertTrue(facade.character_reset_all(confirm=True))
+        runtime.event_bus.emit.assert_called_once_with(Events.Character.CLEAR_HISTORY, {}, sync=True)
+
     def test_history_recent_is_bounded_to_small_response_window(self):
         from discord_bot.admin_facade import DiscordAdminFacade
 

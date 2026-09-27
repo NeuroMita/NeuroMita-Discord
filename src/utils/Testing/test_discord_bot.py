@@ -36,7 +36,26 @@ class DiscordBotConfigTests(unittest.TestCase):
 
         self.assertEqual(config.guild_id, 1341427480942350356)
         self.assertEqual(config.channel_id, 1353745092065624144)
-        self.assertEqual(config.admin_ids, frozenset({292002437932384256}))
+        self.assertEqual(config.admin_ids, frozenset({
+            292002437932384256,
+            418100424583675904,
+            446312390271696927,
+        }))
+
+    def test_configured_admin_ids_cannot_remove_required_project_admins(self):
+        from discord_bot.config import DiscordBotConfig
+
+        with patch.dict(
+            os.environ,
+            {"DISCORD_BOT_TOKEN": "secret", "DISCORD_ADMIN_IDS": "12345"},
+            clear=True,
+        ):
+            config = DiscordBotConfig.from_env()
+
+        self.assertTrue(config.is_admin(292002437932384256))
+        self.assertTrue(config.is_admin(418100424583675904))
+        self.assertTrue(config.is_admin(446312390271696927))
+        self.assertTrue(config.is_admin(12345))
 
     def test_rejects_invalid_guild_id(self):
         from discord_bot.config import DiscordBotConfig
@@ -101,10 +120,27 @@ class DiscordMessageHelpersTests(unittest.TestCase):
         self.assertFalse(is_allowed_location(1341427480942350356, 1))
         self.assertFalse(is_allowed_location(1341427480942350356, 1353745092065624144, is_thread=True))
 
+    def test_trigger_location_uses_configured_override(self):
+        from discord_bot.bot import should_respond_to_message
+        from discord_bot.config import DiscordBotConfig
+
+        config = DiscordBotConfig(token="x", guild_id=10, channel_id=20)
+        self.assertTrue(should_respond_to_message(
+            author_is_bot=False, webhook_id=None, is_dm=False, is_mentioned=True,
+            is_reply_to_bot=False, guild_id=10, channel_id=20, config=config,
+        ))
+        self.assertFalse(should_respond_to_message(
+            author_is_bot=False, webhook_id=None, is_dm=False, is_mentioned=True,
+            is_reply_to_bot=False, guild_id=1341427480942350356,
+            channel_id=1353745092065624144, config=config,
+        ))
+
     def test_only_configured_admin_id_is_admin(self):
         from discord_bot.config import DiscordBotConfig
 
         self.assertTrue(DiscordBotConfig(token="x").is_admin(292002437932384256))
+        self.assertTrue(DiscordBotConfig(token="x").is_admin(418100424583675904))
+        self.assertTrue(DiscordBotConfig(token="x").is_admin(446312390271696927))
         self.assertFalse(DiscordBotConfig(token="x").is_admin(1))
 
     def test_sender_identity_uses_discord_user_id_not_display_name_alone(self):
@@ -151,6 +187,15 @@ class DiscordBotRuntimeTests(unittest.TestCase):
             chat = bot.tree.get_command("chat")
             self.assertIsNotNone(chat)
             self.assertIsNotNone(chat.get_command("ask"))
+            self.assertIsNotNone(bot.tree.get_command("presence"))
+            self.assertIsNotNone(bot.tree.get_command("room"))
+            self.assertIsNotNone(bot.tree.get_command("attention"))
+            character = bot.tree.get_command("character")
+            history = bot.tree.get_command("history")
+            self.assertIsNotNone(character.get_command("reset-all"))
+            self.assertIsNone(history.get_command("reset"))
+            ai = bot.tree.get_command("ai")
+            self.assertIsNotNone(ai.get_command("status"))
             self.assertTrue(bot.intents.message_content)
             self.assertFalse(bot.intents.members)
             self.assertFalse(bot.intents.presences)
@@ -174,9 +219,9 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
                 self.raise_error = False
                 self.generate_args = []
 
-            def generate(self, text, *, sender, origin_message_id):
+            def generate(self, text, *, sender, request_id, ambient_context="", system_input="", event_type="chat"):
                 self.calls += 1
-                self.generate_args.append((text, sender, origin_message_id))
+                self.generate_args.append((text, sender, request_id))
                 self.thread_ids.append(threading.get_ident())
                 self.started.set()
                 if self.raise_error:
@@ -197,7 +242,7 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_runs_off_event_loop_thread(self):
         loop_thread = threading.get_ident()
         task = asyncio.create_task(
-            self.bot._generate("hello", sender="Discord:Tester [id:1]", origin_message_id="2")
+            self.bot._generate("hello", sender="Discord:Tester [id:1]", request_id="2")
         )
         await asyncio.to_thread(self.runtime.started.wait, 1)
         self.runtime.release.set()
@@ -211,12 +256,12 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
         from discord_bot.bot import GenerationBusyError
 
         first = asyncio.create_task(
-            self.bot._generate("first", sender="Discord:Tester [id:1]", origin_message_id="1")
+            self.bot._generate("first", sender="Discord:Tester [id:1]", request_id="1")
         )
         await asyncio.to_thread(self.runtime.started.wait, 1)
         start = time.monotonic()
         with self.assertRaises(GenerationBusyError):
-            await self.bot._generate("second", sender="Discord:Tester [id:1]", origin_message_id="2")
+            await self.bot._generate("second", sender="Discord:Tester [id:1]", request_id="2")
         elapsed = time.monotonic() - start
         self.runtime.release.set()
         await first
@@ -228,7 +273,7 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.raise_error = True
         with self.assertLogs("discord_bot.bot", level="ERROR") as captured:
             result = await self.bot._generate(
-                "hello", sender="Discord:Tester [id:1]", origin_message_id="1"
+                "hello", sender="Discord:Tester [id:1]", request_id="1"
             )
 
         self.assertTrue(captured.records[0].exc_info)
@@ -262,6 +307,25 @@ class DiscordBotGenerationTests(unittest.IsolatedAsyncioTestCase):
         interaction.user.id = 123
         self.assertFalse(await self.bot._require_admin(interaction))
         interaction.response.send_message.assert_awaited_once()
+
+    async def test_debug_health_defers_and_edits_original_response_by_keyword(self):
+        from unittest.mock import AsyncMock
+
+        interaction = Mock()
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
+        self.bot._require_admin = AsyncMock(return_value=True)
+        self.bot.admin.bot_status = Mock(return_value={
+            "message": "healthy", "character_id": "Crazy",
+        })
+        command = self.bot.tree.get_command("debug").get_command("health")
+
+        await command.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.edit_original_response.assert_awaited_once_with(
+            content="healthy | character: Crazy",
+        )
 
 
 if __name__ == "__main__":

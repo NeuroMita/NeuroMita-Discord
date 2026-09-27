@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 
 DEFAULT_GUILD_ID = 1341427480942350356
 DEFAULT_CHANNEL_ID = 1353745092065624144
-DEFAULT_ADMIN_IDS = frozenset({292002437932384256})
+DEFAULT_ADMIN_IDS = frozenset({
+    292002437932384256,
+    418100424583675904,
+    446312390271696927,
+})
+REQUIRED_ADMIN_IDS = DEFAULT_ADMIN_IDS
 
 
 @dataclass(frozen=True)
@@ -41,22 +46,20 @@ class DiscordBotConfig:
         if channel_id <= 0:
             raise ValueError("DISCORD_CHANNEL_ID must be a positive integer")
 
-        raw_admin_ids = os.environ.get("DISCORD_ADMIN_IDS")
-        if raw_admin_ids is None:
-            admin_ids = DEFAULT_ADMIN_IDS
-        else:
-            try:
-                admin_ids = frozenset(
-                    int(item.strip()) for item in raw_admin_ids.split(",") if item.strip()
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "DISCORD_ADMIN_IDS must be a comma-separated list of positive integers"
-                ) from exc
-            if any(value <= 0 for value in admin_ids):
-                raise ValueError(
-                    "DISCORD_ADMIN_IDS must be a comma-separated list of positive integers"
-                )
+        raw_admin_ids = os.environ.get("DISCORD_ADMIN_IDS", "").strip()
+        try:
+            configured_admin_ids = frozenset(
+                int(item.strip()) for item in raw_admin_ids.split(",") if item.strip()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "DISCORD_ADMIN_IDS must be a comma-separated list of positive integers"
+            ) from exc
+        if any(value <= 0 for value in configured_admin_ids):
+            raise ValueError(
+                "DISCORD_ADMIN_IDS must be a comma-separated list of positive integers"
+            )
+        admin_ids = REQUIRED_ADMIN_IDS | configured_admin_ids
 
         return cls(
             token=token,

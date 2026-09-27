@@ -230,5 +230,37 @@ class ReasoningEffortParamTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", _params(enable_thinking=True))
 
 
+class GenerationParameterOverrideTests(unittest.TestCase):
+    def test_request_override_replaces_native_reasoning_and_token_budget_without_mutating_preset(self):
+        from handlers.llm_providers.base import LLMRequest
+        from handlers.llm_providers.common_provider import CommonProvider
+        from handlers.llm_providers.param_mapper import merge_generation_params
+
+        preset = {"max_tokens": 2500, "reasoning": {"enabled": True, "effort": "medium"}}
+        effective = merge_generation_params(
+            preset,
+            {"max_tokens": 512, "reasoning": {"enabled": False}},
+        )
+
+        self.assertEqual(effective, {"max_tokens": 512, "reasoning": {"enabled": False}})
+        self.assertEqual(preset, {"max_tokens": 2500, "reasoning": {"enabled": True, "effort": "medium"}})
+
+        provider = CommonProvider()
+        try:
+            request = LLMRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "decide"}],
+                protocol_id="openrouter_default",
+                dialect_id="openai_chat_completions",
+                native_parameters=effective,
+            )
+            payload = provider._build_payload(request, request.model, request.messages)
+        finally:
+            provider.close()
+
+        self.assertEqual(payload["max_tokens"], 512)
+        self.assertEqual(payload["reasoning"], {"enabled": False})
+
+
 if __name__ == "__main__":
     unittest.main()

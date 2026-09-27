@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import re
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -13,9 +15,16 @@ from discord.ext import commands
 
 from discord_bot.config import DiscordBotConfig
 from discord_bot.config import DEFAULT_CHANNEL_ID, DEFAULT_GUILD_ID
+from discord_bot.diagnostics import DiscordRuntimeDiagnostics
 from discord_bot.response_formatter import split_response
 from discord_bot.character_runtime import DiscordCharacterRuntime
 from discord_bot.admin_facade import DiscordAdminFacade
+from discord_bot.attention import DiscordAttentionService
+from discord_bot.presence_controller import DiscordPresenceController
+from discord_bot.presence_settings import PresenceSettingsStore
+from discord_bot.room_context import DiscordRoomContextBuilder
+from discord_bot.room_timeline import DiscordRoomTimeline, RoomMessage
+from discord_bot.presence_commands import register_presence_commands
 
 
 logger = logging.getLogger(__name__)
@@ -51,10 +60,11 @@ def should_respond_to_message(
     guild_id: int | None = None,
     channel_id: int | None = None,
     is_thread: bool = False,
+    config: DiscordBotConfig | None = None,
 ) -> bool:
     if author_is_bot or webhook_id is not None:
         return False
-    if is_dm or not is_allowed_location(guild_id, channel_id, is_thread=is_thread):
+    if is_dm or not is_allowed_location(guild_id, channel_id, is_thread=is_thread, config=config):
         return False
     return is_mentioned or is_reply_to_bot
 
@@ -89,6 +99,11 @@ class DiscordBot(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.token = token
         self.runtime = runtime
+        data_dir = getattr(runtime, "data_dir", None)
+        self.diagnostics = (
+            DiscordRuntimeDiagnostics(Path(data_dir) / "Logs")
+            if data_dir is not None else None
+        )
         self.admin = DiscordAdminFacade(runtime)
         self.started_at = time.monotonic()
         self.guild_id = guild_id
@@ -98,11 +113,50 @@ class DiscordBot(commands.Bot):
             channel_id=channel_id,
             admin_ids=admin_ids if admin_ids is not None else DiscordBotConfig(token="").admin_ids,
         )
+        if self.diagnostics is not None:
+            self.diagnostics.record(
+                "bot_created", guild_id=guild_id, channel_id=channel_id,
+            )
         self._generation_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="discord-generation"
         )
         self._generation_busy = False
         self._closed = False
+        self._managed_run = False
+        self.presence = None
+        self.room_timeline = None
+        self.presence_settings = None
+        self._room_channel = None
+        self._room_catchup_done = asyncio.Event()
+        if self.presence is None:
+            self._room_catchup_done.set()
+        if hasattr(runtime, "data_dir") and hasattr(runtime, "generate_utility"):
+            data_dir = Path(runtime.data_dir)
+            self.room_timeline = DiscordRoomTimeline(data_dir / "room.sqlite3")
+            self.presence_settings = PresenceSettingsStore(data_dir / "Settings" / "presence.json")
+            context_builder = DiscordRoomContextBuilder(
+                self.room_timeline, guild_id=str(guild_id), channel_id=str(channel_id),
+            )
+            attention = DiscordAttentionService(
+                runtime,
+                character_id_provider=lambda: runtime.active_character_id,
+                preset_id_provider=lambda: runtime.settings.get("DISCORD_ATTENTION_PRESET_ID", None),
+            )
+            self.presence = DiscordPresenceController(
+                timeline=self.room_timeline,
+                context_builder=context_builder,
+                attention=attention,
+                settings=self.presence_settings,
+                run_worker=self._run_presence_worker,
+                generate_social=self._generate_social,
+                generate_initiative=self._generate_initiative,
+                observe_room=self._observe_room,
+                send_public_message=self._send_presence_message,
+                is_generation_busy=lambda: self._generation_busy,
+                diagnostics=self.diagnostics,
+                guild_id=str(guild_id),
+                channel_id=str(channel_id),
+            )
 
         chat = app_commands.Group(name="chat", description="Chat with NeuroMita")
 
@@ -118,24 +172,62 @@ class DiscordBot(commands.Bot):
                     "This bot is not enabled in this channel.", ephemeral=True
                 )
                 return
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "message_received", guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id, trigger="slash",
+                )
             await interaction.response.defer(thinking=True)
+            if self.presence is not None:
+                await self.presence.on_human_message(RoomMessage(
+                    discord_message_id=str(interaction.id),
+                    guild_id=str(interaction.guild_id),
+                    channel_id=str(interaction.channel_id),
+                    author_id=str(interaction.user.id),
+                    author_name=str(getattr(interaction.user, "display_name", interaction.user.name)),
+                    author_kind="human",
+                    content=str(text)[:4000],
+                    created_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                    message_kind="human",
+                ), direct=True)
+                self.presence.notify_direct_generation_started()
+            if self.diagnostics is not None:
+                self.diagnostics.record("direct_generation_started")
             try:
                 response = await self._generate(
                     text,
                     sender=discord_sender(interaction.user),
-                    origin_message_id=str(interaction.id),
+                    request_id=str(interaction.id),
+                    ambient_context=(self.presence.context_builder.build() if self.presence else ""),
                 )
             except GenerationBusyError:
                 await interaction.edit_original_response(content=BUSY_REPLY)
                 return
+            finally:
+                if self.presence is not None:
+                    self.presence.notify_direct_generation_finished()
             chunks = split_response(self._response_text(response))
-            await interaction.edit_original_response(
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "direct_generation_finished", response_chars=sum(map(len, chunks)), chunk_count=len(chunks),
+                )
+            first = await interaction.edit_original_response(
                 content=chunks[0], allowed_mentions=discord.AllowedMentions.none()
             )
+            if self.presence is not None and first is not None:
+                await self.presence.on_mita_message(self._room_message(
+                    first, author_kind="mita", message_kind="mita_direct",
+                ))
             for chunk in chunks[1:]:
-                await interaction.followup.send(
-                    chunk, allowed_mentions=discord.AllowedMentions.none()
+                sent = await interaction.followup.send(
+                    chunk, allowed_mentions=discord.AllowedMentions.none(), wait=True
                 )
+                if self.presence is not None and sent is not None:
+                    await self.presence.on_mita_message(self._room_message(
+                        sent, author_kind="mita", message_kind="mita_direct",
+                    ))
+            if self.diagnostics is not None:
+                self.diagnostics.record("direct_reply_sent", chunk_count=len(chunks))
 
         self.tree.add_command(chat)
 
@@ -208,6 +300,18 @@ class DiscordBot(commands.Bot):
                 "Character switched." if ok else "Unknown character ID.", ephemeral=True
             )
 
+        @character_group.command(name="reset-all", description="Clear character history, memories, state, and graph")
+        @app_commands.describe(confirm="Confirm clearing history, memories, state, and graph data")
+        async def character_reset_all(interaction: discord.Interaction, confirm: bool) -> None:
+            if not await self._require_admin(interaction):
+                return
+            done = self.admin.character_reset_all(confirm=confirm)
+            await interaction.response.send_message(
+                "Character history, memories, state, and graph cleared."
+                if done else "Set confirm=true to clear history, memories, state, and graph data.",
+                ephemeral=True,
+            )
+
         history_group = app_commands.Group(name="history", description="Character history administration")
         @history_group.command(name="status", description="Show history and summary status")
         async def history_status(interaction: discord.Interaction) -> None:
@@ -237,16 +341,6 @@ class DiscordBot(commands.Bot):
             items = self.admin.history_recent(limit)
             lines = [f"{item.get('role', '?')}: {str(item.get('content', ''))[:300]}" for item in items]
             await interaction.response.send_message("\n".join(lines)[-1900:] or "History is empty.", ephemeral=True)
-
-        @history_group.command(name="reset", description="Clear current character history")
-        @app_commands.describe(confirm="Confirm permanent history reset")
-        async def history_reset(interaction: discord.Interaction, confirm: bool) -> None:
-            if not await self._require_admin(interaction):
-                return
-            done = self.admin.history_reset(confirm=confirm)
-            await interaction.response.send_message(
-                "History cleared." if done else "Set confirm=true to clear history.", ephemeral=True
-            )
 
         memory_group = app_commands.Group(name="memory", description="Character memory administration")
         @memory_group.command(name="list", description="List saved memories")
@@ -320,7 +414,7 @@ class DiscordBot(commands.Bot):
             if not await self._require_admin(interaction):
                 return
             chain = self.admin.ai_status()["chain"]
-            lines = [f"{p['id']} | {p['provider']} | {p['model']}" for p in chain]
+            lines = [f"{p['name']} | {p['provider']} | {p['model']}" for p in chain]
             await interaction.response.send_message("\n".join(lines)[-1900:] or "No API presets configured.", ephemeral=True)
 
         self.tree.add_command(bot_group)
@@ -360,20 +454,22 @@ class DiscordBot(commands.Bot):
         async def debug_health(interaction: discord.Interaction) -> None:
             if not await self._require_admin(interaction):
                 return
+            await interaction.response.defer(ephemeral=True, thinking=True)
             status = self.admin.bot_status()
-            await interaction.response.send_message(
-                f"{status.get('message')} | character: {status.get('character_id')}",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content=f"{status.get('message')} | character: {status.get('character_id')}",
             )
 
         @debug_group.command(name="last-error", description="Show the last safe error summary")
         async def debug_last_error(interaction: discord.Interaction) -> None:
             if not await self._require_admin(interaction):
                 return
+            await interaction.response.defer(ephemeral=True, thinking=True)
             error = self.admin.bot_status().get("last_error") or "No recorded errors."
-            await interaction.response.send_message(str(error)[:1500], ephemeral=True)
+            await interaction.edit_original_response(content=str(error)[:1500])
 
         self.tree.add_command(debug_group)
+        register_presence_commands(self)
 
     async def _require_admin(self, interaction: discord.Interaction) -> bool:
         allowed = is_allowed_location(
@@ -386,12 +482,118 @@ class DiscordBot(commands.Bot):
         return allowed
 
     async def setup_hook(self) -> None:
-        if self.guild_id is not None:
-            guild = discord.Object(id=self.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        try:
+            if self.guild_id is not None:
+                guild = discord.Object(id=self.guild_id)
+                self.tree.copy_global_to(guild=guild)
+                commands_synced = await self.tree.sync(guild=guild)
+            else:
+                commands_synced = await self.tree.sync()
+            if self.diagnostics is not None:
+                self.diagnostics.record("commands_synced", count=len(commands_synced))
+        except Exception as exc:
+            if self.diagnostics is not None:
+                self.diagnostics.record("command_sync_failed", exception_type=type(exc).__name__)
+            raise
+
+    async def on_ready(self) -> None:
+        if self.diagnostics is not None:
+            self.diagnostics.record("gateway_ready", bot_id=getattr(self.user, "id", None))
+        if self.presence is None:
+            return
+        try:
+            self._room_catchup_done.clear()
+            channel = self.get_channel(self.config.channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(self.config.channel_id)
+            self._room_channel = channel
+            if self.diagnostics is not None:
+                self.diagnostics.record("channel_ready", channel_id=getattr(channel, "id", None))
+            await self._catch_up_room(channel)
+            await self.presence.start()
+            if self.diagnostics is not None:
+                self.diagnostics.record("presence_ready")
+            logger.info("Discord room presence is ready")
+        except Exception as exc:
+            if self.diagnostics is not None:
+                self.diagnostics.record("presence_start_failed", exception_type=type(exc).__name__)
+            logger.exception("Could not initialize Discord room presence")
+        finally:
+            self._room_catchup_done.set()
+
+    async def _catch_up_room(self, channel) -> None:
+        if self.presence is None or self.user is None:
+            return
+        last_seen = self.room_timeline.last_seen_message_id(
+            guild_id=str(self.config.guild_id), channel_id=str(self.config.channel_id),
+        )
+        cursor = int(last_seen) if last_seen else None
+        first_batch = True
+        while first_batch or last_seen:
+            history = (
+                channel.history(limit=100, oldest_first=False)
+                if cursor is None
+                else channel.history(after=discord.Object(id=cursor), limit=1000, oldest_first=True)
+            )
+            fetched = [message async for message in history]
+            if cursor is None:
+                fetched.reverse()
+            if not fetched:
+                break
+            for message in fetched:
+                cursor = int(message.id)
+                self.room_timeline.set_last_seen_message_id(
+                    guild_id=str(self.config.guild_id), channel_id=str(self.config.channel_id),
+                    message_id=str(message.id),
+                )
+                if message.webhook_id is not None:
+                    continue
+                if message.author.id == self.user.id:
+                    kind, message_kind = "mita", "mita_social"
+                elif message.author.bot:
+                    continue
+                else:
+                    kind, message_kind = "human", "human"
+                if not message.content.strip():
+                    continue
+                self.room_timeline.append_message(self._room_message(
+                    message, author_kind=kind, message_kind=message_kind,
+                ))
+            if not last_seen or len(fetched) < 1000:
+                break
+            last_seen = str(cursor)
+            first_batch = False
+
+    def _room_message(self, message, *, author_kind: str, message_kind: str) -> RoomMessage:
+        reply_id = None
+        reply_author_id = None
+        reply_author_name = None
+        reference = getattr(message, "reference", None)
+        if reference is not None and getattr(reference, "message_id", None) is not None:
+            reply_id = str(reference.message_id)
+            resolved = getattr(reference, "resolved", None)
+            if isinstance(resolved, discord.Message):
+                reply_author_id = str(resolved.author.id)
+                reply_author_name = str(resolved.author.display_name)
+            elif self.room_timeline is not None:
+                prior = self.room_timeline.get_message(reply_id)
+                if prior is not None:
+                    reply_author_id = prior.author_id
+                    reply_author_name = prior.author_name
+        return RoomMessage(
+            discord_message_id=str(message.id),
+            guild_id=str(getattr(getattr(message, "guild", None), "id", self.config.guild_id)),
+            channel_id=str(message.channel.id),
+            author_id=str(message.author.id),
+            author_name=str(getattr(message.author, "display_name", message.author.name)),
+            author_kind=author_kind,
+            content=str(message.content or ""),
+            reply_to_message_id=reply_id,
+            reply_to_author_id=reply_author_id,
+            reply_to_author_name=reply_author_name,
+            created_at=message.created_at.astimezone(dt.timezone.utc).isoformat(),
+            message_kind=message_kind,
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None:
@@ -406,6 +608,22 @@ class DiscordBot(commands.Bot):
             is_thread=is_thread,
             config=self.config,
         ):
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "message_ignored", guild_id=guild_id, channel_id=message.channel.id,
+                    reason="outside_allowed_location",
+                )
+            return
+        if self.presence is not None:
+            await self._room_catchup_done.wait()
+        if message.author.id == self.user.id:
+            return
+        if message.author.bot or message.webhook_id is not None or not message.content.strip():
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "message_ignored", guild_id=guild_id, channel_id=message.channel.id,
+                    reason="bot_or_webhook" if message.author.bot or message.webhook_id is not None else "empty_content",
+                )
             return
         is_mentioned = self.user in message.mentions
         reference = message.reference
@@ -414,6 +632,21 @@ class DiscordBot(commands.Bot):
             isinstance(resolved, discord.Message)
             and resolved.author.id == self.user.id
         )
+        if not is_reply_to_bot and reference is not None and reference.message_id is not None:
+            prior_message = (
+                self.room_timeline.get_message(str(reference.message_id))
+                if self.room_timeline is not None else None
+            )
+            is_reply_to_bot = prior_message is not None and prior_message.author_kind == "mita"
+        is_direct = is_mentioned or is_reply_to_bot
+        if self.diagnostics is not None:
+            self.diagnostics.record(
+                "message_received", guild_id=guild_id, channel_id=message.channel.id,
+                trigger="mention" if is_mentioned else "reply" if is_reply_to_bot else "ambient",
+            )
+        room_message = self._room_message(message, author_kind="human", message_kind="human")
+        if self.presence is not None:
+            await self.presence.on_human_message(room_message, direct=is_direct)
         if not should_respond_to_message(
             author_is_bot=message.author.bot,
             webhook_id=message.webhook_id,
@@ -423,7 +656,13 @@ class DiscordBot(commands.Bot):
             guild_id=guild_id,
             channel_id=message.channel.id,
             is_thread=is_thread,
+            config=self.config,
         ):
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "message_ignored", guild_id=guild_id, channel_id=message.channel.id,
+                    reason="not_direct",
+                )
             return
 
         prompt = (
@@ -432,35 +671,170 @@ class DiscordBot(commands.Bot):
             else " ".join(message.content.split()) or None
         )
         if prompt is None:
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "message_ignored", guild_id=guild_id, channel_id=message.channel.id,
+                    reason="empty_content",
+                )
             return
 
+        if self.presence is not None:
+            self.presence.notify_direct_generation_started()
+        if self.diagnostics is not None:
+            self.diagnostics.record("direct_generation_started")
         try:
             async with message.channel.typing():
                 response = await self._generate(
                     prompt,
                     sender=discord_sender(message.author),
-                    origin_message_id=str(message.id),
+                    request_id=str(message.id),
+                    ambient_context=(
+                        self.presence.context_builder.build(exclude_message_ids={str(message.id)})
+                        if self.presence else ""
+                    ),
                 )
         except GenerationBusyError:
-            await message.reply(
+            sent = await message.reply(
                 BUSY_REPLY,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            if self.presence is not None:
+                await self.presence.on_mita_message(self._room_message(
+                    sent, author_kind="mita", message_kind="mita_direct",
+                ))
             return
-        for chunk in split_response(self._response_text(response)):
-            await message.reply(
-                chunk,
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+        finally:
+            if self.presence is not None:
+                self.presence.notify_direct_generation_finished()
+        response_text = self._response_text(response)
+        chunks = split_response(response_text)
+        if self.diagnostics is not None:
+            self.diagnostics.record(
+                "direct_generation_finished", response_chars=len(response_text), chunk_count=len(chunks),
             )
+        try:
+            for chunk in chunks:
+                sent = await message.reply(
+                    chunk,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                if self.presence is not None:
+                    await self.presence.on_mita_message(self._room_message(
+                        sent, author_kind="mita", message_kind="mita_direct",
+                    ))
+            if self.diagnostics is not None:
+                self.diagnostics.record("direct_reply_sent", chunk_count=len(chunks))
+        except Exception as exc:
+            if self.diagnostics is not None:
+                self.diagnostics.record(
+                    "discord_send_failed", exception_type=type(exc).__name__,
+                    status=getattr(exc, "status", None),
+                )
+            raise
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        if self.presence is None or after.guild is None:
+            return
+        if not is_allowed_location(
+            after.guild.id, after.channel.id, is_thread=isinstance(after.channel, discord.Thread),
+            config=self.config,
+        ) or after.author.bot or after.webhook_id is not None:
+            return
+        await self._room_catchup_done.wait()
+        self.room_timeline.update_message(str(after.id), content=after.content)
+        await self.presence.notify_room_changed()
+
+    async def on_message_delete(self, message: discord.Message) -> None:
+        if self.presence is None or message.guild is None:
+            return
+        if not is_allowed_location(
+            message.guild.id, message.channel.id,
+            is_thread=isinstance(message.channel, discord.Thread), config=self.config,
+        ):
+            return
+        await self._room_catchup_done.wait()
+        self.room_timeline.mark_deleted(str(message.id))
+        await self.presence.notify_room_changed()
+
+    async def _run_presence_worker(self, function):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._generation_executor, function)
+
+    async def _generate_social(self, ambient_context: str, request_id: str):
+        return await self._generate(
+            "", sender="DiscordRoom", request_id=request_id,
+            ambient_context=ambient_context, event_type="discord_social",
+        )
+
+    async def _generate_initiative(self, ambient_context: str, request_id: str, mode: str):
+        return await self._generate(
+            "", sender="DiscordRoom", request_id=request_id,
+            ambient_context=ambient_context, event_type="discord_initiative",
+            system_input=mode,
+        )
+
+    async def _observe_room(self, ambient_context: str, request_id: str):
+        return await self._generate(
+            "", sender="DiscordRoom", request_id=request_id,
+            ambient_context=ambient_context, event_type="discord_room_observe",
+        )
+
+    async def _send_presence_message(self, content: str, reply_to_id: str | None, message_kind: str):
+        if self._room_channel is None:
+            return None
+        sent = []
+        for chunk in split_response(content):
+            if reply_to_id:
+                try:
+                    target = await self._room_channel.fetch_message(int(reply_to_id))
+                    current = await target.reply(
+                        chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.NotFound, discord.Forbidden, ValueError):
+                    current = await self._room_channel.send(
+                        chunk, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            else:
+                current = await self._room_channel.send(
+                    chunk, allowed_mentions=discord.AllowedMentions.none(),
+                )
+            sent.append(current)
+            if self.presence is not None:
+                await self.presence.on_mita_message(self._room_message(
+                    current, author_kind="mita", message_kind=message_kind,
+                ))
+        return sent[-1] if sent else None
+
+    async def clear_room_context(self) -> int:
+        if self.presence is None:
+            return 0
+        latest_id = getattr(self._room_channel, "last_message_id", None)
+        if self._room_channel is not None:
+            try:
+                async for latest in self._room_channel.history(limit=1):
+                    latest_id = latest.id
+                    break
+            except discord.HTTPException:
+                logger.warning("Could not refresh Discord room cursor while clearing room context")
+        removed = self.presence.clear_room()
+        if latest_id is not None:
+            self.room_timeline.set_last_seen_message_id(
+                guild_id=str(self.config.guild_id), channel_id=str(self.config.channel_id),
+                message_id=str(latest_id),
+            )
+        return removed
 
     async def _generate(
         self,
         text: str,
         *,
         sender: str,
-        origin_message_id: str,
+        request_id: str,
+        ambient_context: str = "",
+        system_input: str = "",
+        event_type: str = "chat",
     ) -> Any:
         if self._generation_busy:
             raise GenerationBusyError
@@ -469,20 +843,47 @@ class DiscordBot(commands.Bot):
         try:
             return await loop.run_in_executor(
                 self._generation_executor,
-                lambda: self.runtime.generate(
-                    text,
-                    sender=sender,
-                    origin_message_id=origin_message_id,
+                lambda: self._run_character_generation(
+                    text, sender=sender, request_id=request_id,
+                    ambient_context=ambient_context, system_input=system_input,
+                    event_type=event_type,
                 ),
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Discord LLM generation raised an exception")
+            if self.diagnostics is not None:
+                self.diagnostics.record("generation_failed", exception_type=type(exc).__name__)
             record_error = getattr(self.runtime, "record_error", None)
             if callable(record_error):
                 record_error("Generation raised an exception; details are in server logs.")
             return None
         finally:
             self._generation_busy = False
+
+    def _run_character_generation(
+        self, text: str, *, sender: str, request_id: str,
+        ambient_context: str, system_input: str, event_type: str,
+    ):
+        if event_type == "chat" and callable(getattr(self.runtime, "generate_direct", None)):
+            return self.runtime.generate_direct(
+                text=text, sender=sender, discord_message_id=request_id,
+                ambient_context=ambient_context,
+            )
+        if event_type == "discord_social" and callable(getattr(self.runtime, "generate_social", None)):
+            return self.runtime.generate_social(ambient_context=ambient_context, request_id=request_id)
+        if event_type == "discord_initiative" and callable(getattr(self.runtime, "generate_initiative", None)):
+            return self.runtime.generate_initiative(
+                ambient_context=ambient_context, request_id=request_id, mode=system_input,
+            )
+        if event_type == "discord_room_observe" and callable(getattr(self.runtime, "observe_room", None)):
+            return self.runtime.observe_room(
+                ambient_context=ambient_context, request_id=request_id,
+            )
+        return self.runtime.generate(
+            text, sender=sender, request_id=request_id,
+            ambient_context=ambient_context, system_input=system_input,
+            event_type=event_type,
+        )
 
     def _response_text(self, response: Any) -> str:
         text = getattr(response, "text", None)
@@ -505,13 +906,32 @@ class DiscordBot(commands.Bot):
             return
         self._closed = True
         try:
+            if self.presence is not None:
+                await self.presence.stop()
             await super().close()
         finally:
             self._generation_executor.shutdown(wait=True, cancel_futures=True)
-            self.runtime.close()
+            if self.room_timeline is not None:
+                self.room_timeline.close()
+            try:
+                self.runtime.close()
+            finally:
+                if self.diagnostics is not None and not self._managed_run:
+                    self.diagnostics.record("bot_stopped")
+                    self.diagnostics.close()
 
     def run_configured(self) -> None:
-        self.run(self.token, log_handler=None)
+        self._managed_run = True
+        try:
+            self.run(self.token, log_handler=None)
+        except Exception as exc:
+            if self.diagnostics is not None:
+                self.diagnostics.record("gateway_failed", exception_type=type(exc).__name__)
+            raise
+        finally:
+            if self.diagnostics is not None:
+                self.diagnostics.record("bot_stopped")
+                self.diagnostics.close()
 
 
 def create_bot(

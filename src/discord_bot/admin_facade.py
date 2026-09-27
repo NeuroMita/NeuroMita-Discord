@@ -68,7 +68,7 @@ class DiscordAdminFacade:
     def history_summary(self) -> str:
         return self.history_controller.get_summary(self._character())
 
-    def history_reset(self, *, confirm: bool = False) -> bool:
+    def character_reset_all(self, *, confirm: bool = False) -> bool:
         if not confirm:
             return False
         from core.events import Events

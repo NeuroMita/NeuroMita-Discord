@@ -35,13 +35,32 @@ export DISCORD_GUILD_ID='123456789012345678'
 # Optional: restrict to one channel; defaults target the NeuroMita test channel.
 export DISCORD_CHANNEL_ID='1353745092065624144'
 # Optional: comma-separated admin user IDs; defaults to the project owner.
-export DISCORD_ADMIN_IDS='292002437932384256'
+export DISCORD_ADMIN_IDS='292002437932384256,418100424583675904,446312390271696927'
 PYTHONPATH=src python -m discord_bot
 ```
 
 Slash commands are synced to `DISCORD_GUILD_ID`. In the Discord Developer Portal, enable **Message Content Intent** for the bot. The runtime requests no members or presence intents. It responds only in the configured guild and channel; DMs and threads are ignored. Mentions, replies, and `/chat ask` share the active NeuroMita character's history across Discord users. RAG uses the `Keyword+FTS only` preset (SQLite FTS5 and keyword search; vector search and reranking remain off). LLM work is limited to one generation at a time and runs outside the Discord event loop. Long answers are split into Discord-sized messages.
 
+Each process writes a separate privacy-safe diagnostic file under `<NEUROMITA_DISCORD_DATA_DIR>/Logs/` (default `DiscordData/Logs/`) named `discord-runtime-<pid>-<run-id>.jsonl`. Entries include only lifecycle, trigger type, gate/attention decisions, response lengths, and exception class/status; message text, prompts, tokens, and API keys are excluded. The filename and each record identify the exact process run. These files are retained between runs.
+
 Only IDs in `DISCORD_ADMIN_IDS` can use the ephemeral `/bot`, `/character`, `/history`, `/memory`, `/ai`, `/compression`, and `/debug` administration commands, and only in the configured channel. History resets and memory deletion require an explicit confirmation argument. Prompt assets should be installed in the normal NeuroMita `Prompts` tree or selected with `NEUROMITA_PROMPTS_DIR`.
+
+## Stage 4: Ambient room presence
+
+The configured channel is observed as a shared room. Human messages, Mita's public replies, edits, and deletions are stored in `DiscordData/room.sqlite3`; other bots, webhooks, DMs, threads, and other channels are ignored. A bounded recent transcript plus a separately compressed room summary is added as hidden context to character generations. This room timeline is separate from NeuroMita character history and memory. When old room messages are summarized, a silent request also passes the summarized room context through the normal character memory pipeline; history writes, voice, streaming, and UI echo are disabled for that observation. Ambient context can also inform memory operations during a real reply. Neither path writes the room transcript as fake user dialogue.
+
+Defaults are intentionally conservative: `alive` mode, initiative 55/100, 6–12 second social debounce, four-minute voluntary cooldown, and at most three voluntary public messages per hour. Direct mentions and replies still take priority. The autonomous timer wakes with jitter, checks local gates first, and only considers an attention-model request after the room has been quiet for 15 minutes. The attention model uses a single bounded utility request; invalid output or provider failure means silence. The Python-side revision, busy, cooldown, and hourly-budget gates run again before generation and posting. Room history is caught up after reconnect, without replying to old messages.
+
+Owner-only commands in the configured channel:
+
+- `/presence status`, `/presence on`, `/presence off`
+- `/presence mode direct|social|alive`, `/presence initiative`, `/presence cooldown`, `/presence max-hour`
+- `/presence pause`, `/presence resume`, `/presence speak-now`
+- `/attention test` evaluates the room without posting a response
+- `/room status`, `/room recent`, `/room summary`, `/room summarize`, `/room reset confirm:true`
+- `/character reset-all confirm:true` clears character history, memories, state, and graph data
+
+`/room reset` clears only the Discord room timeline and summary. Presence settings and NeuroMita character history/memory remain separate. The bot also needs **Read Message History** in its allowed channel for restart catch-up. On Linux, keep the data directory private (`chmod 700 DiscordData`); the room database is created with owner-only file permissions.
 
 Discord conversation history and memory share the active character's standard NeuroMita storage under `DiscordData/Histories` and its character memory database. Do not share this runtime data directory with a desktop NeuroMita process while both are running.
 

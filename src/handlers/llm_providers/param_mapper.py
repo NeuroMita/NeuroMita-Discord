@@ -1,7 +1,16 @@
 # src/handlers/llm_providers/param_mapper.py
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict
+
+
+def merge_generation_params(base: Dict[str, Any] | None, overrides: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Return request parameters with explicit per-request values taking precedence."""
+    merged = deepcopy(base or {})
+    for key, value in (overrides or {}).items():
+        merged[key] = deepcopy(value)
+    return merged
 
 
 def _strip_nuls_in_strings(obj: Any) -> Any:

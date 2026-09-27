@@ -10,6 +10,41 @@ sys.path.insert(0, os.path.abspath("src"))
 
 
 class DiscordCharacterRuntimeRequestTests(unittest.TestCase):
+    def test_room_observation_runs_native_memory_pipeline_without_history_or_fake_turn(self):
+        from discord_bot.character_runtime import DiscordCharacterRuntime
+
+        result = object()
+        generation = Mock(return_value=result)
+        generation.generate_chat.return_value = result
+        runtime = DiscordCharacterRuntime.__new__(DiscordCharacterRuntime)
+        runtime._generation_service = generation
+        runtime._character_id = "Crazy"
+        runtime._started = True
+        runtime._closed = False
+        runtime._controllers = {"character": Mock()}
+        runtime._controllers["character"].get_current_ref.return_value = type(
+            "Character", (), {"char_id": "Crazy"}
+        )()
+
+        actual = runtime.observe_room(
+            ambient_context="observed participants discuss an ongoing issue",
+            request_id="discord-observe-1",
+        )
+
+        self.assertIs(actual, result)
+        request = generation.generate_chat.call_args.args[0]
+        self.assertEqual(request.event_type, "discord_room_observe")
+        self.assertEqual(request.user_input, "")
+        self.assertEqual(request.sender, "DiscordRoom")
+        self.assertEqual(request.req_id, "discord-observe-1")
+        self.assertIsNone(request.origin_message_id)
+        self.assertEqual(request.hidden_user_context, "observed participants discuss an ongoing issue")
+        self.assertFalse(request.policy.use_history_in_prompt)
+        self.assertFalse(request.policy.write_to_history)
+        self.assertFalse(request.policy.allow_voiceover)
+        self.assertFalse(request.policy.allow_streaming)
+        self.assertFalse(request.policy.echo_to_ui)
+
     def test_runtime_bootstraps_character_pipeline_without_desktop_or_ml_imports(self):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ)
@@ -66,7 +101,8 @@ print('character runtime lightweight bootstrap OK')
         actual = runtime.generate(
             "remember this",
             sender="Discord:Test user [id:292002437932384256]",
-            origin_message_id="1461234567890123456",
+            request_id="1461234567890123456",
+            ambient_context="observed room context",
         )
 
         self.assertIs(actual, result)
@@ -74,13 +110,42 @@ print('character runtime lightweight bootstrap OK')
         self.assertEqual(request.character_id, "Crazy")
         self.assertEqual(request.user_input, "remember this")
         self.assertEqual(request.sender, "Discord:Test user [id:292002437932384256]")
-        self.assertEqual(request.origin_message_id, "1461234567890123456")
+        self.assertEqual(request.req_id, "1461234567890123456")
+        self.assertIsNone(request.origin_message_id)
+        self.assertEqual(request.hidden_user_context, "observed room context")
         self.assertEqual(request.event_type, "chat")
+        self.assertEqual(request.generation_params_override, {})
         self.assertTrue(request.policy.use_history_in_prompt)
         self.assertTrue(request.policy.write_to_history)
         self.assertFalse(request.policy.allow_voiceover)
         self.assertFalse(request.policy.allow_streaming)
         self.assertFalse(request.policy.echo_to_ui)
+
+    def test_proactive_character_turn_bounds_completion_and_reasoning(self):
+        from discord_bot.character_runtime import DiscordCharacterRuntime
+
+        generation = Mock()
+        generation.generate_chat.return_value = object()
+        runtime = DiscordCharacterRuntime.__new__(DiscordCharacterRuntime)
+        runtime._generation_service = generation
+        runtime._started = True
+        runtime._closed = False
+        runtime._controllers = {"character": Mock()}
+        runtime._controllers["character"].get_current_ref.return_value = type(
+            "Character", (), {"char_id": "Crazy"}
+        )()
+
+        runtime.generate_initiative(
+            ambient_context="a recent room conversation",
+            request_id="discord-initiative-1",
+            mode="start_topic",
+        )
+
+        request = generation.generate_chat.call_args.args[0]
+        self.assertEqual(request.generation_params_override, {
+            "max_tokens": 1200,
+            "reasoning": {"enabled": True, "max_tokens": 256},
+        })
 
     def test_memory_embed_schedule_does_not_initialize_rag_when_disabled(self):
         from managers.memory_manager import MemoryManager

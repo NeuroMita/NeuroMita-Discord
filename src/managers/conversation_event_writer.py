@@ -398,7 +398,8 @@ class ConversationEventWriter:
         turn_id = ConversationMessageIds.turn(task_uid or req_id)
 
         user_event = None
-        if resolved_speaker.kind is DialogueActorKind.PLAYER or not origin_message_id:
+        has_user_payload = bool(str(user_input or "").strip() or image_data)
+        if has_user_payload and (resolved_speaker.kind is DialogueActorKind.PLAYER or not origin_message_id):
             user_event = self._build_user_event_message(
                 speaker=sender,
                 target=responder_character_id,
